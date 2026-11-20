@@ -438,7 +438,7 @@ try{
  }
  await chooseLanguage('ar');await page.reload();
  await page.waitForSelector('header[data-ready="true"]');
- check(await select.inputValue()==='ar','Language persists after reload');
+ check(await select.inputValue()==='ar'&&await page.locator('html').getAttribute('dir')==='rtl','Language and direction persist after reload');
  await chooseLanguage('it');
  const venue={label:'Caffè Florian, Piazza San Marco 57, Venezia',geo:{
   latitude:45.4336,longitude:12.33828,kind:'venue',attribution:'© OpenStreetMap contributors'
