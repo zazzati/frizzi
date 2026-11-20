@@ -1,4 +1,6 @@
 use reqwest::Url;
+
+use super::MailKind;
 use std::fmt::Write;
 
 pub(super) struct MessageText {
@@ -53,6 +55,7 @@ impl MessageText {
     }
 }
 
+#[derive(Clone)]
 pub struct Details {
     pub description: Option<String>,
     pub location: String,
@@ -62,6 +65,8 @@ pub struct Details {
     pub confirmed: bool,
     pub website: Option<Url>,
     pub calendar: Option<String>,
+    /// The participant link of an organizer who also answered the poll with the same address.
+    pub response: Option<String>,
     pub notes: String,
 }
 
@@ -78,18 +83,31 @@ impl Details {
     }
 }
 
-pub fn plain(
-    lang: &str,
-    kind: &str,
-    headline: &str,
-    title: &str,
-    intro: &str,
-    url: &str,
-    details: Option<&Details>,
-    message: Option<&MessageText>,
-) -> String {
+/// Everything a rendered email shows apart from its subject line.
+pub struct Content<'a> {
+    pub lang: &'a str,
+    pub kind: MailKind,
+    pub headline: &'a str,
+    pub title: &'a str,
+    pub intro: &'a str,
+    pub url: &'a str,
+    pub details: Option<&'a Details>,
+    pub message: Option<&'a MessageText>,
+}
+
+pub fn plain(content: &Content) -> String {
+    let Content {
+        lang,
+        kind,
+        headline,
+        title,
+        intro,
+        url,
+        details,
+        message,
+    } = *content;
     let mut body = String::new();
-    if kind == "confirmed" {
+    if kind == MailKind::Confirmed {
         let _ = writeln!(body, "{headline}");
     }
     let _ = write!(body, "{intro}\n\n{title}\n\n{url}\n");
@@ -124,6 +142,13 @@ pub fn plain(
                 body,
                 "\n{}: {calendar}",
                 rust_i18n::t!("ui.addCalendar", locale = lang)
+            );
+        }
+        if let Some(response) = &d.response {
+            let _ = writeln!(
+                body,
+                "\n{}: {response}",
+                rust_i18n::t!("ui.edit", locale = lang)
             );
         }
         if !d.notes.is_empty() {
@@ -190,6 +215,16 @@ fn facts(lang: &str, d: &Details) -> String {
             )
         })
         .unwrap_or_default();
+    let response = d
+        .response
+        .as_ref()
+        .map(|url| {
+            format!(
+                r#"<p style="margin:14px 0 0">{}</p>"#,
+                link(&rust_i18n::t!("ui.edit", locale = lang), url)
+            )
+        })
+        .unwrap_or_default();
     let notes = if d.notes.is_empty() {
         String::new()
     } else {
@@ -209,7 +244,7 @@ fn facts(lang: &str, d: &Details) -> String {
     <strong style="font-size:14px">📍 {location_label}</strong><br>{location}<br>{directions}{website}
   </td></tr>
 </table>
-{calendar}{notes}"##,
+{calendar}{response}{notes}"##,
         date_label = escape(&d.date_label(lang)),
         dates = lines(&d.dates),
         timezone = escape(&format!(
@@ -222,28 +257,34 @@ fn facts(lang: &str, d: &Details) -> String {
     )
 }
 
-pub fn html(
-    lang: &str,
-    kind: &str,
-    headline: &str,
-    title: &str,
-    intro: &str,
-    url: &str,
-    details: Option<&Details>,
-    message: Option<&MessageText>,
-) -> String {
+pub fn html(content: &Content) -> String {
+    let Content {
+        lang,
+        kind,
+        headline,
+        title,
+        intro,
+        url,
+        details,
+        message,
+    } = *content;
     let (banner, accent, icon) = match kind {
-        "confirmed" => ("#d9f59d", "#fff0b2", "🎉"),
-        "cancelled" => ("#f7e2e1", "#f7e2e1", ""),
-        "changed" | "open" => ("#ffefae", "#ffd2bc", "✦"),
-        "vote" => ("#e9dfff", "#d9f59d", "✓"),
-        "message" => ("#e9dfff", "#ffd2bc", "💌"),
-        _ => ("#dcefd4", "#ffeaaf", "✦"),
+        MailKind::Confirmed => ("#d9f59d", "#fff0b2", "🎉"),
+        MailKind::Cancelled => ("#f7e2e1", "#f7e2e1", ""),
+        MailKind::Changed | MailKind::Open => ("#ffefae", "#ffd2bc", "✦"),
+        MailKind::Vote => ("#e9dfff", "#d9f59d", "✓"),
+        MailKind::Message => ("#e9dfff", "#ffd2bc", "💌"),
+        MailKind::Admin | MailKind::Recover => ("#dcefd4", "#ffeaaf", "✦"),
     };
     let action = match kind {
-        "admin" => "mail.manageEvent",
-        "vote" => "ui.edit",
-        _ => "mail.openEvent",
+        MailKind::Admin => "mail.manageEvent",
+        MailKind::Vote => "ui.edit",
+        MailKind::Recover
+        | MailKind::Message
+        | MailKind::Open
+        | MailKind::Confirmed
+        | MailKind::Cancelled
+        | MailKind::Changed => "mail.openEvent",
     };
     let (direction, align) = if lang == "ar" {
         ("rtl", "right")
@@ -399,18 +440,19 @@ mod tests {
             website: None,
             calendar: Some(r#"https://x.test/cal.ics?"onmouseover=alert(1)"#.into()),
             notes: format!("Note {script}\n"),
+            response: None,
         };
         let message = MessageText::parse(&format!("<b>Hey</b> {script}")).unwrap();
-        let page = html(
-            "en",
-            "message",
-            &format!("Head {script}"),
-            &format!("Title {script}"),
-            "Intro \"quoted\"",
-            "https://frizzi.test/abc?x=\"y\"",
-            Some(&details),
-            Some(&message),
-        );
+        let page = html(&Content {
+            lang: "en",
+            kind: MailKind::Message,
+            headline: &format!("Head {script}"),
+            title: &format!("Title {script}"),
+            intro: "Intro \"quoted\"",
+            url: "https://frizzi.test/abc?x=\"y\"",
+            details: Some(&details),
+            message: Some(&message),
+        });
         assert!(!page.contains("<script"), "{page}");
         assert!(!page.contains(r#""onmouseover"#));
         let escaped = "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;";
@@ -421,16 +463,16 @@ mod tests {
         assert!(page.contains("Intro &quot;quoted&quot;"));
         assert!(page.contains(r#"href="https://frizzi.test/abc?x=&quot;y&quot;""#));
 
-        let text = plain(
-            "en",
-            "message",
-            "Head",
-            "Title",
-            "Intro",
-            "https://frizzi.test/abc",
-            Some(&details),
-            Some(&message),
-        );
+        let text = plain(&Content {
+            lang: "en",
+            kind: MailKind::Message,
+            headline: "Head",
+            title: "Title",
+            intro: "Intro",
+            url: "https://frizzi.test/abc",
+            details: Some(&details),
+            message: Some(&message),
+        });
         assert!(text.contains(&format!("Hey {script}")), "{text}");
         assert!(text.contains(&format!("Note {script}")));
     }

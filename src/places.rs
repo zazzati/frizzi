@@ -4,8 +4,15 @@ use serde_json::json;
 use sqlx::PgPool;
 use std::{sync::LazyLock, time::Duration};
 
+use crate::error::{bad, ApiError, ApiResult};
+use crate::limits::{per_ip, rate_limits, ClientIp};
 use crate::observability::upstream_class;
-use crate::{bad, db, locale, rate_limit, ApiError, ApiResult};
+use crate::validate::locale;
+
+/// Lookups per client per hour, within the global cap below.
+const LOOKUPS_PER_IP: i32 = 30;
+/// 120 lookups per hour keeps the public endpoint within the free daily allowance.
+const LOOKUPS_PER_HOUR: i32 = 120;
 
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 
@@ -93,7 +100,7 @@ impl LocationGeo {
 #[derive(Deserialize)]
 pub struct Search {
     text: String,
-    #[serde(default = "crate::default_locale")]
+    #[serde(default = "crate::validate::default_locale")]
     locale: String,
 }
 
@@ -165,11 +172,16 @@ impl ProviderPlace {
                 .and_then(|source| source.attribution)
                 .filter(|text| !text.trim().is_empty() && text.chars().count() <= 255),
         };
-        (crate::valid(&label, 255) && geo.validate().is_ok()).then_some(Suggestion { label, geo })
+        (crate::validate::valid(&label, 255) && geo.validate().is_ok())
+            .then_some(Suggestion { label, geo })
     }
 }
 
-pub async fn suggest(State(pool): State<PgPool>, Json(search): Json<Search>) -> ApiResult {
+pub async fn suggest(
+    State(pool): State<PgPool>,
+    ip: ClientIp,
+    Json(search): Json<Search>,
+) -> ApiResult {
     let text = search.text.trim();
     if !(3..=255).contains(&text.chars().count()) || text.contains("://") {
         return Err(bad());
@@ -181,10 +193,14 @@ pub async fn suggest(State(pool): State<PgPool>, Json(search): Json<Search>) -> 
         return Ok(Json(json!({"enabled": false, "suggestions": []})));
     };
 
-    // 120 lookups per hour keeps the public endpoint within the free daily allowance.
-    let mut tx = pool.begin().await.map_err(db)?;
-    rate_limit(&mut tx, "geoapify:autocomplete", 120).await?;
-    tx.commit().await.map_err(db)?;
+    rate_limits(
+        &pool,
+        &[
+            (ip.key("geoapify"), per_ip(LOOKUPS_PER_IP)),
+            ("geoapify:autocomplete".into(), LOOKUPS_PER_HOUR),
+        ],
+    )
+    .await?;
 
     let response = CLIENT
         .get("https://api.geoapify.com/v1/geocode/autocomplete")
@@ -215,7 +231,7 @@ pub async fn suggest(State(pool): State<PgPool>, Json(search): Json<Search>) -> 
 }
 
 fn unavailable() -> ApiError {
-    crate::error(axum::http::StatusCode::BAD_GATEWAY, "location_unavailable")
+    crate::error::error(axum::http::StatusCode::BAD_GATEWAY, "location_unavailable")
 }
 
 fn log_failure(operation: &'static str, error: &reqwest::Error) {
