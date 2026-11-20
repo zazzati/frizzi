@@ -67,15 +67,7 @@ pub async fn download(
     lines.extend(["END:VEVENT".into(), "END:VCALENDAR".into()]);
     let mut body = String::new();
     for line in lines {
-        let mut column = 0;
-        for character in line.chars() {
-            if column + character.len_utf8() > 75 {
-                body.push_str("\r\n ");
-                column = 1;
-            }
-            body.push(character);
-            column += character.len_utf8();
-        }
+        body.push_str(&fold_line(&line));
         body.push_str("\r\n");
     }
     Ok((
@@ -89,6 +81,21 @@ pub async fn download(
         body,
     )
         .into_response())
+}
+
+/// Folds a content line at 75 octets (RFC 5545 §3.1) without splitting a UTF-8 character.
+fn fold_line(line: &str) -> String {
+    let mut folded = String::with_capacity(line.len());
+    let mut column = 0;
+    for character in line.chars() {
+        if column + character.len_utf8() > 75 {
+            folded.push_str("\r\n ");
+            column = 1;
+        }
+        folded.push(character);
+        column += character.len_utf8();
+    }
+    folded
 }
 
 fn timestamp(date: DateTime<Utc>) -> String {
@@ -118,4 +125,77 @@ fn escape_text(value: &str) -> String {
         .replace('\n', "\\n")
         .replace(',', "\\,")
         .replace(';', "\\;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+    use chrono_tz::Europe::Rome;
+
+    fn rome_to_utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> String {
+        let local = NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, 0)
+            .unwrap();
+        timestamp(to_utc(Rome, local).unwrap())
+    }
+
+    #[test]
+    fn local_times_convert_to_utc_across_dst_transitions() {
+        assert_eq!(rome_to_utc(2027, 1, 15, 20, 0), "20270115T190000Z");
+        assert_eq!(rome_to_utc(2027, 6, 15, 20, 0), "20270615T180000Z");
+        // 02:30 does not exist on 2027-03-28; the pre-jump offset (+01:00) is used.
+        assert_eq!(rome_to_utc(2027, 3, 28, 2, 30), "20270328T013000Z");
+        // 02:30 happens twice on 2027-10-31; the earlier instant (+02:00) wins.
+        assert_eq!(rome_to_utc(2027, 10, 31, 2, 30), "20271031T003000Z");
+    }
+
+    #[test]
+    fn text_values_escape_ical_specials() {
+        assert_eq!(
+            escape_text("a,b;c\\d\r\ne\rf\ng"),
+            "a\\,b\\;c\\\\d\\ne\\nf\\ng"
+        );
+        assert_eq!(escape_text("plain"), "plain");
+    }
+
+    fn assert_folded(line: &str, folded: &str) {
+        assert_eq!(
+            folded.replace("\r\n ", ""),
+            line,
+            "unfolding restores input"
+        );
+        for (i, part) in folded.split("\r\n").enumerate() {
+            assert!(
+                part.len() <= 75,
+                "physical line {i} is {} octets",
+                part.len()
+            );
+            assert!(i == 0 || part.starts_with(' '));
+        }
+    }
+
+    #[test]
+    fn lines_fold_at_75_octets() {
+        let short = "A".repeat(75);
+        assert_eq!(fold_line(&short), short);
+        let long = "A".repeat(76);
+        assert_eq!(fold_line(&long), format!("{}\r\n A", "A".repeat(75)));
+        let longer = "B".repeat(200);
+        let folded = fold_line(&longer);
+        assert_eq!(folded.matches("\r\n ").count(), 2);
+        assert_folded(&longer, &folded);
+    }
+
+    #[test]
+    fn folding_never_splits_multibyte_characters() {
+        // 37 × "é" = 74 octets; the 38th would cross the limit.
+        let accents = "é".repeat(40);
+        let folded = fold_line(&accents);
+        assert_eq!(folded, format!("{}\r\n {}", "é".repeat(37), "é".repeat(3)));
+        assert_folded(&accents, &folded);
+        let mixed = format!("SUMMARY:{}", "Cena 🍝 da Ada · ".repeat(10));
+        assert_folded(&mixed, &fold_line(&mixed));
+    }
 }

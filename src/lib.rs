@@ -15,7 +15,7 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
-use chrono::{Datelike, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{
@@ -295,14 +295,24 @@ fn validate_details(
         && slots.iter().all(|s| s.end.is_none_or(|end| end > s.start))
 }
 fn deadline_passed(deadline: Option<NaiveDate>, timezone: &str) -> bool {
+    deadline_passed_at(deadline, timezone, Utc::now())
+}
+fn deadline_passed_at(deadline: Option<NaiveDate>, timezone: &str, now: DateTime<Utc>) -> bool {
     deadline.is_some_and(|date| {
         let timezone = timezone.parse::<chrono_tz::Tz>().unwrap_or(chrono_tz::UTC);
-        Utc::now().with_timezone(&timezone).date_naive() > date
+        now.with_timezone(&timezone).date_naive() > date
     })
 }
 fn validate_deadline(deadline: Option<NaiveDate>, timezone: &str) -> Result<(), ApiError> {
+    validate_deadline_at(deadline, timezone, Utc::now())
+}
+fn validate_deadline_at(
+    deadline: Option<NaiveDate>,
+    timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<(), ApiError> {
     if deadline.is_some_and(|date| !(1..=9999).contains(&date.year()))
-        || deadline_passed(deadline, timezone)
+        || deadline_passed_at(deadline, timezone, now)
     {
         return Err(error(StatusCode::BAD_REQUEST, "invalid_deadline"));
     }
@@ -1101,5 +1111,89 @@ mod tests {
         assert_eq!(locale("ar"), "ar");
         assert_eq!(locale("xx"), "it");
         assert_eq!(email(" ADA@example.com ").unwrap(), "ada@example.com");
+    }
+
+    fn day(y: i32, m: u32, d: u32) -> Option<NaiveDate> {
+        NaiveDate::from_ymd_opt(y, m, d)
+    }
+
+    fn utc(text: &str) -> DateTime<Utc> {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn deadline_closes_after_its_day_ends_in_the_event_timezone() {
+        let deadline = day(2027, 1, 10);
+        let now = utc("2027-01-10T12:00:00Z");
+        // Auckland (UTC+13) is already on Jan 11; Los Angeles (UTC-8) is still on Jan 10.
+        assert!(deadline_passed_at(deadline, "Pacific/Auckland", now));
+        assert!(!deadline_passed_at(deadline, "America/Los_Angeles", now));
+        assert!(!deadline_passed_at(deadline, "UTC", now));
+        assert!(!deadline_passed_at(
+            deadline,
+            "UTC",
+            utc("2027-01-10T23:59:59Z")
+        ));
+        assert!(deadline_passed_at(
+            deadline,
+            "UTC",
+            utc("2027-01-11T00:00:00Z")
+        ));
+        // Rome is UTC+1 in January: Jan 10 23:00Z is already Jan 11 there.
+        assert!(deadline_passed_at(
+            deadline,
+            "Europe/Rome",
+            utc("2027-01-10T23:00:00Z")
+        ));
+        assert!(!deadline_passed_at(
+            deadline,
+            "Europe/Rome",
+            utc("2027-01-10T22:59:59Z")
+        ));
+        // Unknown zones fall back to UTC; no deadline never passes.
+        assert!(!deadline_passed_at(deadline, "Mars/City", now));
+        assert!(!deadline_passed_at(
+            None,
+            "UTC",
+            utc("9999-12-31T00:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn deadline_validation_rejects_past_and_out_of_range_dates() {
+        let now = utc("2027-01-10T12:00:00Z");
+        assert!(validate_deadline_at(None, "UTC", now).is_ok());
+        assert!(validate_deadline_at(day(2027, 1, 10), "UTC", now).is_ok());
+        assert!(validate_deadline_at(day(9999, 12, 31), "UTC", now).is_ok());
+        assert!(validate_deadline_at(day(2027, 1, 9), "UTC", now).is_err());
+        assert!(validate_deadline_at(day(2027, 1, 10), "Pacific/Auckland", now).is_err());
+        assert!(validate_deadline_at(day(10000, 1, 1), "UTC", now).is_err());
+        assert!(validate_deadline_at(day(0, 1, 1), "UTC", now).is_err());
+    }
+
+    #[test]
+    fn details_patch_distinguishes_missing_from_null() {
+        let parse = |extra: Value| {
+            let mut body = json!({
+                "title": "Cena", "location": "Roma", "organizer_name": "Ada",
+                "allow_multiple_choices": false, "timezone": "Europe/Rome", "slots": []
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<DetailsInput>(body).unwrap()
+        };
+        let missing = parse(json!({}));
+        assert_eq!(missing.voting_deadline, None);
+        assert!(missing.location_geo.is_none());
+        let cleared = parse(json!({"voting_deadline": null, "location_geo": null}));
+        assert_eq!(cleared.voting_deadline, Some(None));
+        assert_eq!(cleared.location_geo, Some(None));
+        let set = parse(json!({
+            "voting_deadline": "2027-01-10",
+            "location_geo": {"latitude": 1.0, "longitude": 2.0, "kind": "venue", "attribution": null}
+        }));
+        assert_eq!(set.voting_deadline, Some(day(2027, 1, 10)));
+        assert!(matches!(set.location_geo, Some(Some(_))));
     }
 }

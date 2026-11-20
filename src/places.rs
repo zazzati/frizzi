@@ -270,4 +270,31 @@ mod tests {
             Some("© OpenStreetMap contributors")
         );
     }
+
+    #[test]
+    fn geo_validation_bounds_coordinates_attribution_and_place_id() {
+        let check = |patch: serde_json::Value| {
+            let mut geo = json!({"latitude": 45.0, "longitude": 7.0, "kind": "venue"});
+            geo.as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            serde_json::from_value::<LocationGeo>(geo)
+                .unwrap()
+                .validate()
+                .is_ok()
+        };
+        assert!(check(json!({})));
+        assert!(check(json!({"latitude": 90.0, "longitude": -180.0})));
+        assert!(check(json!({"latitude": -90.0, "longitude": 180.0})));
+        assert!(!check(json!({"latitude": 90.01})));
+        assert!(!check(json!({"longitude": -180.01})));
+        // Attribution is limited by characters, not bytes.
+        assert!(check(json!({"attribution": "é".repeat(255)})));
+        assert!(!check(json!({"attribution": "a".repeat(256)})));
+        assert!(check(json!({"place_id": "51a3f0c2DE"})));
+        assert!(check(json!({"place_id": "a".repeat(1024)})));
+        assert!(!check(json!({"place_id": ""})));
+        assert!(!check(json!({"place_id": "a".repeat(1025)})));
+        assert!(!check(json!({"place_id": "abc/../x"})));
+    }
 }

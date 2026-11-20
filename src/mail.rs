@@ -809,4 +809,57 @@ mod tests {
             assert_eq!(query.len(), 2);
         }
     }
+
+    #[test]
+    fn numeric_dates_follow_locale_order_and_native_digits() {
+        let date = NaiveDate::from_ymd_opt(2027, 6, 5).unwrap();
+        for (lang, expected) in [
+            ("it", "05/06/2027"),
+            ("en", "05/06/2027"),
+            ("de", "05.06.2027"),
+            ("ru", "05.06.2027"),
+            ("zh", "2027/06/05"),
+            ("ar", "٠٥/٠٦/٢٠٢٧"),
+            ("bn", "০৫/০৬/২০২৭"),
+        ] {
+            assert_eq!(numeric_date(date, lang), expected, "{lang}");
+        }
+    }
+
+    fn slot(end: Option<(u32, u32)>) -> SlotInput {
+        let time = |(h, m)| chrono::NaiveTime::from_hms_opt(h, m, 0).unwrap();
+        SlotInput {
+            id: None,
+            date: NaiveDate::from_ymd_opt(2027, 6, 15).unwrap(),
+            start: time((20, 0)),
+            end: end.map(time),
+        }
+    }
+
+    // Documents current behaviour: `%X` renders seconds in every locale, and
+    // hi/bn additionally append "UTC" to what is really event-local time.
+    #[test]
+    fn slots_render_weekday_date_and_times() {
+        let slots = [slot(Some((22, 30))), slot(None)];
+        assert_eq!(
+            format_slots(&slots, "it"),
+            "martedì · 15/06/2027 · 20:00:00 – 22:30:00\nmartedì · 15/06/2027 · 20:00:00"
+        );
+        for (lang, expected) in [
+            ("en", "Tuesday · 15/06/2027 · 20:00:00"),
+            ("de", "Dienstag · 15.06.2027 · 20:00:00"),
+            ("ar", "الثلاثاء · ١٥/٠٦/٢٠٢٧ · 20:00:00"),
+            ("zh", "星期二 · 2027/06/15 · 20时00分00秒"),
+            ("xx", "martedì · 15/06/2027 · 20:00:00"),
+        ] {
+            assert_eq!(format_slots(&slots[1..], lang), expected, "{lang}");
+        }
+        for lang in ["hi", "bn"] {
+            let text = format_slots(&slots[1..], lang);
+            assert!(
+                text.contains("08:00:00") && text.ends_with(" UTC"),
+                "{text}"
+            );
+        }
+    }
 }

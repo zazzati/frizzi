@@ -304,3 +304,134 @@ pub fn html(
         action = escape(&rust_i18n::t!(action, locale = lang)),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(input: &str) -> (String, String) {
+        let message = MessageText::parse(input).expect("non-empty message");
+        (message.plain, message.html)
+    }
+
+    fn html_of(input: &str) -> String {
+        parse(input).1
+    }
+
+    #[test]
+    fn escape_covers_html_specials() {
+        assert_eq!(escape(r#"&<>"'"#), "&amp;&lt;&gt;&quot;&#39;");
+        assert_eq!(escape("&lt;"), "&amp;lt;");
+    }
+
+    #[test]
+    fn message_keeps_whitelisted_tags_and_line_breaks() {
+        assert_eq!(
+            parse("Hi <b>all</b>, <i>see</i> <em>you</em> <strong>at</strong> <u>8</u>"),
+            (
+                "Hi all, see you at 8".into(),
+                "Hi <b>all</b>, <i>see</i> <em>you</em> <strong>at</strong> <u>8</u>".into()
+            )
+        );
+        assert_eq!(
+            parse("a<br>b<br/>c<br />d\ne"),
+            ("a\nb\nc\nd\ne".into(), "a<br>b<br>c<br>d<br>e".into())
+        );
+        assert_eq!(
+            html_of("<strong><em>both</em></strong>"),
+            "<strong><em>both</em></strong>"
+        );
+    }
+
+    #[test]
+    fn message_escapes_tags_with_attributes_or_unknown_names() {
+        // Tags with attributes are not stripped: the whole tag becomes literal text.
+        assert_eq!(
+            parse(r#"<b onclick="x()">hi</b>"#),
+            (
+                r#"<b onclick="x()">hi</b>"#.into(),
+                "&lt;b onclick=&quot;x()&quot;&gt;hi&lt;/b&gt;".into()
+            )
+        );
+        assert_eq!(
+            html_of("<script>alert('x')</script>"),
+            "&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"
+        );
+        assert_eq!(html_of("<B>caps</B>"), "&lt;B&gt;caps&lt;/B&gt;");
+        assert_eq!(html_of("<<b>>"), "&lt;&lt;b&gt;&gt;");
+    }
+
+    #[test]
+    fn message_balances_mismatched_and_unclosed_tags() {
+        assert_eq!(html_of("<b><i>x</b></i>"), "<b><i>x&lt;/b&gt;</i></b>");
+        assert_eq!(html_of("</b>stray"), "&lt;/b&gt;stray");
+        assert_eq!(html_of("<b><u>open"), "<b><u>open</u></b>");
+        assert_eq!(
+            parse("1 < 2 and 3 > 2"),
+            ("1 < 2 and 3 > 2".into(), "1 &lt; 2 and 3 &gt; 2".into())
+        );
+        assert_eq!(
+            parse("a < b <i>c"),
+            ("a < b <i>c".into(), "a &lt; b &lt;i&gt;c".into())
+        );
+    }
+
+    #[test]
+    fn message_escapes_entities_and_rejects_blank_input() {
+        assert_eq!(
+            html_of(r#"Tom & "Jerry's" &amp;"#),
+            "Tom &amp; &quot;Jerry&#39;s&quot; &amp;amp;"
+        );
+        assert!(MessageText::parse("").is_none());
+        assert!(MessageText::parse("  <b> </b><br>\n").is_none());
+    }
+
+    #[test]
+    fn rendered_mail_escapes_user_fields() {
+        let script = r#"<script>alert("x")</script>"#;
+        let details = Details {
+            description: Some(format!("Desc {script} 'q'")),
+            location: format!("Loc {script}"),
+            directions: Url::parse("https://maps.example.test/?q=a\"b").unwrap(),
+            timezone: "Europe/Rome".into(),
+            dates: "martedì · 15/06/2027".into(),
+            confirmed: true,
+            website: None,
+            calendar: Some(r#"https://x.test/cal.ics?"onmouseover=alert(1)"#.into()),
+            notes: format!("Note {script}\n"),
+        };
+        let message = MessageText::parse(&format!("<b>Hey</b> {script}")).unwrap();
+        let page = html(
+            "en",
+            "message",
+            &format!("Head {script}"),
+            &format!("Title {script}"),
+            "Intro \"quoted\"",
+            "https://frizzi.test/abc?x=\"y\"",
+            Some(&details),
+            Some(&message),
+        );
+        assert!(!page.contains("<script"), "{page}");
+        assert!(!page.contains(r#""onmouseover"#));
+        let escaped = "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;";
+        for field in ["Head", "Title", "Desc", "Loc", "Note"] {
+            assert!(page.contains(&format!("{field} {escaped}")), "{field}");
+        }
+        assert!(page.contains("<b>Hey</b> &lt;script&gt;"));
+        assert!(page.contains("Intro &quot;quoted&quot;"));
+        assert!(page.contains(r#"href="https://frizzi.test/abc?x=&quot;y&quot;""#));
+
+        let text = plain(
+            "en",
+            "message",
+            "Head",
+            "Title",
+            "Intro",
+            "https://frizzi.test/abc",
+            Some(&details),
+            Some(&message),
+        );
+        assert!(text.contains(&format!("Hey {script}")), "{text}");
+        assert!(text.contains(&format!("Note {script}")));
+    }
+}
