@@ -10,21 +10,22 @@
  import { slotProblems } from '#lib/slots.ts';
  import { track } from '#lib/telemetry.ts';
  import { viewerZone } from '#lib/timezones.ts';
+ import { onSubmit } from '#lib/utils.ts';
 
- /** Receives the public link and the title of the new event. */
- export let created: (link: string, title: string) => void;
+ /** `created` receives the public link and the title of the new event. */
+ let { created }: { created: (link: string, title: string) => void } = $props();
 
- let draft = emptyDraft(), organizer_email = '';
- let busy = false, errorCode = '', slotsChecked = false;
+ let draft = $state(emptyDraft()), organizer_email = $state('');
+ let busy = $state(false), errorCode = $state(''), slotsChecked = $state(false);
  // From the first attempt on, each row shows what is wrong with it and clears as it is fixed.
- $: problems = slotsChecked ? slotProblems(draft.slots) : new Map();
+ const problems = $derived(slotsChecked ? slotProblems(draft.slots) : new Map());
 
  // The home link starts over, also when it is the page already shown.
  function reset() {
    draft = emptyDraft(viewerZone()); organizer_email = '';
    errorCode = ''; slotsChecked = false;
  }
- onMount(() => draft.timezone = viewerZone());
+ onMount(() => { draft.timezone = viewerZone(); });
  afterNavigate(reset);
 
  async function create() {
@@ -46,7 +47,7 @@
   <h1>{$t.create}</h1>
   <div class="party-guests party-guests--trio" aria-hidden="true"></div>
  </div>
- <form id="form" on:submit|preventDefault={create} class="form-shell party-card">
+ <form id="form" onsubmit={onSubmit(create)} class="form-shell party-card">
  <fieldset disabled={busy}>
   <EventFields {problems} bind:title={draft.title} bind:description={draft.description} bind:location={draft.location} bind:locationGeo={draft.locationGeo}
    bind:slots={draft.slots} bind:allow_multiple_choices={draft.allow_multiple_choices} bind:timezone={draft.timezone} bind:votingDeadline={draft.votingDeadline}/>

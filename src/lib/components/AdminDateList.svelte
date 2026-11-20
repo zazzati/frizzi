@@ -2,22 +2,24 @@
  import { CalendarDays } from '@lucide/svelte';
  import { Button } from '#lib/components/ui/button/index.ts';
  import { formatDate, formatTime, lang, plural, t } from '#lib/i18n.ts';
- import type { EventPage } from '#lib/event-page.ts';
+ import type { EventPage } from '#lib/event.svelte.ts';
  import type { EventData } from '#lib/types.ts';
 
- export let view: EventPage;
- export let event: EventData;
- /** The date picked on the calendar, outlined in the list. */
- export let highlighted: string | null;
- export let confirm: (id: string) => void;
- const { busy, tiebreakSaving, results, zones } = view;
+ type Props = {
+   view: EventPage;
+   event: EventData;
+   /** The date picked on the calendar, outlined in the list. */
+   highlighted: string | null;
+   confirm: (id: string) => void;
+ };
+ let { view, event, highlighted, confirm }: Props = $props();
 </script>
 
 <div class="date-list">{#each event.slots as slot}
- {@const count=$results.counts.get(slot.id)||0}
- {@const leading=$results.leadingSlots.some(leader=>leader.id===slot.id)}
- {@const yours=$zones.viewerTime(slot)}
- <div class="date-option" id={`option-${slot.id}`} tabindex="-1" class:calendar-target={highlighted===slot.id} class:chosen={event.confirmed_slot_id===slot.id || leading} class:tiebreak-picked={$results.decisiveSlot?.id===slot.id}>
+ {@const count=view.counts.get(slot.id)||0}
+ {@const leading=view.leadingSlots.some(leader=>leader.id===slot.id)}
+ {@const yours=view.viewerTime(slot)}
+ <div class="date-option" id={`option-${slot.id}`} tabindex="-1" class:calendar-target={highlighted===slot.id} class:chosen={event.confirmed_slot_id===slot.id || leading} class:tiebreak-picked={view.decisiveSlot?.id===slot.id}>
  <div class="date-item">
   <span class="date-item-icon"><CalendarDays size={16} aria-hidden="true"/></span>
   <span>
@@ -27,7 +29,7 @@
    <small>{$plural('availableOf',count,{total:event.participants.length})}{leading?` · ${$t.leadingDate}`:''}</small>
   </span>
  </div>
- <Button id={`confirm-${slot.id}`} variant="outline" class="small-button" disabled={$busy || $tiebreakSaving || event.confirmed_slot_id===slot.id} onclick={()=>confirm(slot.id)} aria-label={`${$t.confirm} · ${formatDate(slot.date,$lang)}`}>{$t.confirm}</Button>
+ <Button id={`confirm-${slot.id}`} variant="outline" class="small-button" disabled={view.busy || view.tiebreakSaving || event.confirmed_slot_id===slot.id} onclick={()=>confirm(slot.id)} aria-label={`${$t.confirm} · ${formatDate(slot.date,$lang)}`}>{$t.confirm}</Button>
 </div>{/each}</div>
 
 <style>

@@ -8,22 +8,26 @@
  import { slotDraft, type SlotProblem } from '#lib/slots.ts';
  import { canonicalZone, zoneDetails, zoneOptions } from '#lib/timezones.ts';
  import type { LocationGeo, SlotDraft } from '#lib/types.ts';
- export let title=''; export let description=''; export let location='';
- export let locationGeo: LocationGeo | null = null;
- export let slots:SlotDraft[]=[slotDraft()];
- export let allow_multiple_choices=true; export let timezone='Europe/Rome';
- export let editing=false;
- export let votingDeadline='';
- /** Rows the last save attempt rejected, keyed by row key; they update as the rows are fixed. */
- export let problems: Map<number, SlotProblem> = new Map();
+
+ type Props = {
+   title?: string; description?: string; location?: string; locationGeo?: LocationGeo | null;
+   slots?: SlotDraft[]; allow_multiple_choices?: boolean; timezone?: string; editing?: boolean; votingDeadline?: string;
+   /** Rows the last save attempt rejected, keyed by row key; they update as the rows are fixed. */
+   problems?: Map<number, SlotProblem>;
+ };
+ let {
+   title = $bindable(''), description = $bindable(''), location = $bindable(''), locationGeo = $bindable(null),
+   slots = $bindable([slotDraft()]), allow_multiple_choices = $bindable(true), timezone = $bindable('Europe/Rome'),
+   editing = false, votingDeadline = $bindable(''), problems = new Map()
+ }: Props = $props();
  let addButton: HTMLButtonElement, zoneInput: HTMLInputElement;
  // The zone list is built on first focus: hundreds of labels are only worth it when someone opens it.
- let listedFor: string | null = null, zoneTouched = false;
- $: locale = intlLocale($lang);
- $: zoneList = listedFor === null ? [] : zoneOptions(locale, listedFor);
- $: zone = canonicalZone(timezone);
- $: zoneInput?.setCustomValidity(zone ? '' : $t.invalidTimezone);
- $: zoneHint = zone ? zoneDetails(zone, locale) : '';
+ let listedFor = $state<string | null>(null), zoneTouched = $state(false);
+ const locale = $derived(intlLocale($lang));
+ const zoneList = $derived(listedFor === null ? [] : zoneOptions(locale, listedFor));
+ const zone = $derived(canonicalZone(timezone));
+ $effect(() => zoneInput.setCustomValidity(zone ? '' : $t.invalidTimezone));
+ const zoneHint = $derived(zone ? zoneDetails(zone, locale) : '');
 
  async function addDate() {
    const previous = slots.at(-1);
@@ -65,16 +69,16 @@
   <TimeSelect name={`start-${i}`} label={$t.start} required bind:value={slot.start}/>
   <TimeSelect name={`end-${i}`} label={$t.end} invalid={problem==='endBeforeStart'} describedBy={problem==='endBeforeStart'?errorId:undefined} bind:value={slot.end}/>
  </div>
- {#if slots.length>1}<button type="button" class="remove" id={`remove-${slot.key}`} aria-label={`${$t.remove} · ${slot.date?formatDate(slot.date,$lang):`${$t.date} ${i+1}`}`} on:click={()=>removeDate(i)}><X size={18} aria-hidden="true"/></button>{/if}
+ {#if slots.length>1}<button type="button" class="remove" id={`remove-${slot.key}`} aria-label={`${$t.remove} · ${slot.date?formatDate(slot.date,$lang):`${$t.date} ${i+1}`}`} onclick={()=>removeDate(i)}><X size={18} aria-hidden="true"/></button>{/if}
  {#if problem}<p class="field-error slot-error" id={errorId}>{$t[problem]}</p>{/if}
 </div>{/each}
-<button class="text-button icon-button" type="button" disabled={slots.length>=100} bind:this={addButton} on:click={addDate}><Plus size={17} aria-hidden="true"/>{$t.add}</button>
+<button class="text-button icon-button" type="button" disabled={slots.length>=100} bind:this={addButton} onclick={addDate}><Plus size={17} aria-hidden="true"/>{$t.add}</button>
 <label class="check"><input name="multiple" type="checkbox" bind:checked={allow_multiple_choices}/>{$t.multiple}</label>
 <div class="form-grid">
  <div>
   <label>{$t.timezone}<input name="timezone" required maxlength="64" list="timezone-options" autocomplete="off" spellcheck="false"
    aria-describedby="timezone-hint" aria-invalid={zoneTouched && !zone} bind:this={zoneInput} bind:value={timezone}
-   on:focus={()=>{if(listedFor===null)listedFor=timezone;}} on:invalid={()=>zoneTouched=true} on:change={()=>{if(zone)timezone=zone;}}/></label>
+   onfocus={()=>{if(listedFor===null)listedFor=timezone;}} oninvalid={()=>zoneTouched=true} onchange={()=>{if(zone)timezone=zone;}}/></label>
   {#if zoneList.length}<datalist id="timezone-options">{#each zoneList as option (option.zone)}<option value={option.zone}>{option.label}</option>{/each}</datalist>{/if}
   <small class="block mt-1" class:fine={zone || !zoneTouched} class:field-error={!zone && zoneTouched} id="timezone-hint">{zone ? zoneHint : zoneTouched ? $t.invalidTimezone : $t.timezoneHint}</small>
  </div>

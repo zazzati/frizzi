@@ -4,7 +4,7 @@
  import { RotateCw } from '@lucide/svelte';
  import { Button } from '#lib/components/ui/button/index.ts';
  import { t } from '#lib/i18n.ts';
- $: missing=page.status===404;
+ const missing = $derived(page.status===404);
 </script>
 
 <svelte:head><title>{missing?$t.pageNotFound:$t.errorTitle} · Frizzi</title></svelte:head>

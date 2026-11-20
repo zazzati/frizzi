@@ -6,17 +6,17 @@
  import type { LocationGeo } from '#lib/types.ts';
  import LocationAttribution from './LocationAttribution.svelte';
 
- export let location = '';
- export let locationGeo: LocationGeo | null = null;
+ type Props = { location?: string; locationGeo?: LocationGeo | null };
+ let { location = $bindable(''), locationGeo = $bindable(null) }: Props = $props();
  type Suggestion = { label: string; geo: LocationGeo };
- let suggestions: Suggestion[] = [];
- let active = -1;
+ let suggestions = $state<Suggestion[]>([]);
+ let active = $state(-1);
  let enabled = true;
- let focused = false;
- let failed = false;
+ let focused = $state(false);
+ let failed = $state(false);
  let timer: ReturnType<typeof setTimeout>;
  let controller: AbortController | undefined;
- $: expanded = focused && suggestions.length > 0;
+ const expanded = $derived(focused && suggestions.length > 0);
 
  function reset() {
    clearTimeout(timer);
@@ -83,7 +83,7 @@
 </script>
 
 <div class="relative min-w-0"
- on:focusout={(event) => {
+ onfocusout={(event) => {
    if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) focused = false;
  }}>
  <label for="event-location">{$t.location} *</label>
@@ -93,8 +93,8 @@
    role="combobox" aria-autocomplete="list" aria-expanded={expanded}
    aria-controls={expanded ? 'location-suggestions' : undefined}
    aria-activedescendant={expanded && active >= 0 ? `location-option-${active}` : undefined}
-   on:input={input} on:keydown={keydown}
-   on:focus={() => focused = true}
+   oninput={input} onkeydown={keydown}
+   onfocus={() => focused = true}
  />
  {#if expanded}
   <div class="location-dropdown">
@@ -102,7 +102,7 @@
     {#each suggestions as result, index}
      <!-- svelte-ignore a11y_click_events_have_key_events (the combobox input handles keyboard selection) -->
      <li id={`location-option-${index}`} role="option" aria-selected={active === index}
-       on:mousedown={(event) => event.preventDefault()} on:click={() => select(result)}>
+       onmousedown={(event) => event.preventDefault()} onclick={() => select(result)}>
       <MapPin size={16} class="shrink-0" aria-hidden="true"/>
       <div>
        {result.label}

@@ -19,7 +19,9 @@ export default defineConfig({
    ? node({ out: process.env.FRIZZI_BUILD_DIR || 'build' })
    : vercel({ runtime: 'nodejs22.x' }),
   paths: { base },
-  preprocess: vitePreprocess()
+  preprocess: vitePreprocess(),
+  // Runes mode for the app's own components; libraries keep the mode they were written in.
+  compilerOptions: { runes: ({ filename }) => filename.split(/[/\\]/).includes('node_modules') ? undefined : true }
  })],
  server: { proxy }
 });

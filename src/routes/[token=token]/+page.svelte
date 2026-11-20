@@ -4,12 +4,14 @@
  import EventShell from '#lib/components/EventShell.svelte';
  import RecoverLink from '#lib/components/RecoverLink.svelte';
  import VotePanel from '#lib/components/VotePanel.svelte';
- import { eventPage } from '#lib/event-page.ts';
- const view = eventPage('event');
+ import { EventPage } from '#lib/event.svelte.ts';
+ const view = new EventPage('event');
  afterNavigate(() => void view.open(page.params.token!));
 </script>
 
-<EventShell {view} let:event>
- <VotePanel {view} {event}/>
- <RecoverLink {view}/>
+<EventShell {view}>
+ {#snippet children(event)}
+  <VotePanel {view} {event}/>
+  <RecoverLink {view}/>
+ {/snippet}
 </EventShell>

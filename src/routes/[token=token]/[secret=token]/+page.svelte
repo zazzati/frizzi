@@ -4,13 +4,15 @@
  import EventShell from '#lib/components/EventShell.svelte';
  import RecoverLink from '#lib/components/RecoverLink.svelte';
  import VotePanel from '#lib/components/VotePanel.svelte';
- import { eventPage } from '#lib/event-page.ts';
+ import { EventPage } from '#lib/event.svelte.ts';
  // A participant's private link: the saved answer loads with the event and saving replaces it.
- const view = eventPage('edit');
+ const view = new EventPage('edit');
  afterNavigate(() => void view.open(page.params.token!, page.params.secret!));
 </script>
 
-<EventShell {view} let:event>
- <VotePanel {view} {event}/>
- <RecoverLink {view}/>
+<EventShell {view}>
+ {#snippet children(event)}
+  <VotePanel {view} {event}/>
+  <RecoverLink {view}/>
+ {/snippet}
 </EventShell>

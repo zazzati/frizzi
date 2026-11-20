@@ -1,5 +1,5 @@
 <script lang="ts">
- export let source: string | null = null;
+ let { source = null }: { source?: string | null } = $props();
 </script>
 
 <p class="mt-1 text-xs text-[#536357]">

@@ -4,12 +4,11 @@
  import { Check } from '@lucide/svelte';
  import ShareActions from './ShareActions.svelte';
  import { errorText, t } from '#lib/i18n.ts';
- /** The public link of the event just created. */
- export let link: string;
- export let title: string;
+ /** `link` is the public link of the event just created. */
+ let { link, title }: { link: string; title: string } = $props();
  let heading: HTMLElement;
- let errorCode = '';
- onMount(() => heading?.focus());
+ let errorCode = $state('');
+ onMount(() => heading.focus());
 </script>
 
 <div class="party-scene party-scene--success">

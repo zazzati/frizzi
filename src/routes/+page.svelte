@@ -3,7 +3,7 @@
  import CreateForm from '#lib/components/CreateForm.svelte';
  import CreateSuccess from '#lib/components/CreateSuccess.svelte';
  // The new event's links stay on this URL; following the home link again shows an empty form.
- let created: { link: string; title: string } | null = null;
+ let created = $state<{ link: string; title: string } | null>(null);
  afterNavigate(() => created = null);
 </script>
 

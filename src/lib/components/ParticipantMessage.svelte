@@ -5,23 +5,28 @@
  import { messagePreview } from '#lib/message.ts';
  import { numberFormat } from '#lib/intl.ts';
  import type { Question } from '#lib/types.ts';
+ import { onSubmit } from '#lib/utils.ts';
 
- export let recipients: number;
- export let send: (message: string, requestId: string) => Promise<{queued: number}>;
- /** The page's confirmation dialog: an email to every participant cannot be taken back. */
- export let ask: (question: Question) => Promise<boolean>;
+ type Props = {
+   recipients: number;
+   send: (message: string, requestId: string) => Promise<{queued: number}>;
+   /** The page's confirmation dialog: an email to every participant cannot be taken back. */
+   ask: (question: Question) => Promise<boolean>;
+ };
+ let { recipients, send, ask }: Props = $props();
 
- let field: HTMLTextAreaElement;
- let message = '';
- let sending = false;
- let queued: number | null = null;
- let error = '';
+ let field = $state<HTMLTextAreaElement>();
+ let message = $state('');
+ let sending = $state(false);
+ let queued = $state<number | null>(null);
+ let error = $state('');
  let attempt: {message: string; id: string} | undefined;
- $: numbers = numberFormat(intlLocale($lang));
+ const numbers = $derived(numberFormat(intlLocale($lang)));
  // Same rules as the email: only the allowed tags render, everything else shows as typed.
- $: preview = messagePreview(message.trim());
+ const preview = $derived(messagePreview(message.trim()));
 
  function format(tag: 'b' | 'i' | 'u') {
+   if (!field) return;
    const {selectionStart: start, selectionEnd: end} = field;
    const next = message.slice(0, start) + `<${tag}>` + message.slice(start, end) + `</${tag}>` + message.slice(end);
    if (next.length > 2000) return;
@@ -57,12 +62,12 @@
  {#if recipients === 0}
   <p class="fine">{$t.noPeopleOrganizer}</p>
  {:else}
-  <form on:submit|preventDefault={submit}>
+  <form onsubmit={onSubmit(submit)}>
    <label for="participant-message">{$t.participantMessage}</label>
    <div class="formatting">
-    <button type="button" aria-label={$t.messageBold} title={$t.messageBold} disabled={sending} on:click={()=>format('b')}><Bold size={16}/></button>
-    <button type="button" aria-label={$t.messageItalic} title={$t.messageItalic} disabled={sending} on:click={()=>format('i')}><Italic size={16}/></button>
-    <button type="button" aria-label={$t.messageUnderline} title={$t.messageUnderline} disabled={sending} on:click={()=>format('u')}><Underline size={16}/></button>
+    <button type="button" aria-label={$t.messageBold} title={$t.messageBold} disabled={sending} onclick={()=>format('b')}><Bold size={16}/></button>
+    <button type="button" aria-label={$t.messageItalic} title={$t.messageItalic} disabled={sending} onclick={()=>format('i')}><Italic size={16}/></button>
+    <button type="button" aria-label={$t.messageUnderline} title={$t.messageUnderline} disabled={sending} onclick={()=>format('u')}><Underline size={16}/></button>
    </div>
    <textarea id="participant-message" rows="4" maxlength="2000" required disabled={sending}
     aria-describedby="participant-message-hint" bind:this={field} bind:value={message}></textarea>

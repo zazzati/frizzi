@@ -1,23 +1,30 @@
 <script lang="ts">
- import { onDestroy, onMount } from 'svelte';
+ import { onMount, type Snippet } from 'svelte';
  import { Copy, Share2 } from '@lucide/svelte';
  import { Button } from '#lib/components/ui/button/index.ts';
  import { t } from '#lib/i18n.ts';
  import { track } from '#lib/telemetry.ts';
 
- /** The public event link. */
- export let url: string;
- export let title: string;
- /** Buttons only, for a row that already holds the link field; otherwise the buttons get their own row. */
- export let inline = false;
- /** Called with '' when a copy starts and with `copy_failed` when the clipboard refuses it. */
- export let feedback: (code: string) => void;
+ type Props = {
+   /** The public event link. */
+   url: string;
+   title: string;
+   /** Buttons only, for a row that already holds the link field; otherwise the buttons get their own row. */
+   inline?: boolean;
+   /** Called with '' when a copy starts and with `copy_failed` when the clipboard refuses it. */
+   feedback: (code: string) => void;
+   /** Further links to copy, such as the organizer's, share the confirmation and its announcement. */
+   children?: Snippet<[copy: (text: string) => void, copied: boolean]>;
+ };
+ let { url, title, inline = false, feedback, children }: Props = $props();
 
- let copied: '' | 'public' | 'other' = '';
- let canShare = false;
+ let copied = $state<'' | 'public' | 'other'>('');
+ let canShare = $state(false);
  let copiedTimer: ReturnType<typeof setTimeout> | undefined;
- onMount(() => canShare = typeof navigator.share === 'function');
- onDestroy(() => clearTimeout(copiedTimer));
+ onMount(() => {
+   canShare = typeof navigator.share === 'function';
+   return () => clearTimeout(copiedTimer);
+ });
 
  async function copy(text = url, which: 'public' | 'other' = 'public') {
    feedback('');
@@ -45,6 +52,5 @@
   {#if canShare}<Button variant="outline" onclick={share}><Share2 size={16}/>{$t.shareAction}</Button>{/if}
  </div>
  <span class="sr-only" role="status">{copied?$t.copied:''}</span>
- <!-- Further links to copy, such as the organizer's, share the confirmation and its announcement. -->
- <slot copy={(text: string) => copy(text, 'other')} copied={copied==='other'}/>
+ {@render children?.(text => copy(text, 'other'), copied==='other')}
 {/if}

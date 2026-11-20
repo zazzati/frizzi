@@ -5,12 +5,18 @@
  import type { PollState } from '#lib/poll.ts';
  import type { EventData, Slot } from '#lib/types.ts';
 
- export let event: EventData;
- export let pollState: PollState;
- export let confirmed: Slot | undefined;
- /** Zone names in the page language, and the viewer's own time for a slot when it differs. */
- export let zones: { event: string; local: string; viewerTime: (slot: Slot) => string | null };
- export let calendarHref: string;
+ type Props = {
+   event: EventData;
+   pollState: PollState;
+   confirmed: Slot | undefined;
+   /** Zone names in the page language. */
+   eventZone: string;
+   localZone: string;
+   /** The viewer's own time for a slot, when it differs from the event's. */
+   viewerTime: (slot: Slot) => string | null;
+   calendarHref: string;
+ };
+ let { event, pollState, confirmed, eventZone, localZone, viewerTime, calendarHref }: Props = $props();
 
  const pollStates = {
    open: { icon: Vote, label: 'open' },
@@ -26,12 +32,13 @@
    } catch { /* Plain place names and addresses are handled separately. */ }
    return null;
  }
- $: locationLink = !event.location_geo ? webLocation(event.location) : null;
+ const locationLink = $derived(!event.location_geo ? webLocation(event.location) : null);
+ const StateIcon = $derived(pollStates[pollState].icon);
 </script>
 
 <section class="event-header">
  <span class="poll-status" data-state={pollState}>
-  <svelte:component this={pollStates[pollState].icon} size={17} aria-hidden="true"/>
+  <StateIcon size={17} aria-hidden="true"/>
   {$t[pollStates[pollState].label]}
  </span>
  <h1><bdi>{event.title}</bdi></h1>
@@ -64,14 +71,14 @@
   </div>
   <div class="event-facts">
    <span class="event-fact"><Users size={16} aria-hidden="true"/><span>{$t.organized} <strong><bdi>{event.organizer_name}</bdi></strong></span></span>
-   <span class="event-fact" title={event.timezone}><Clock size={16} aria-hidden="true"/><span class="sr-only">{$t.timezone}</span><bdi>{zones.event}</bdi></span>
+   <span class="event-fact" title={event.timezone}><Clock size={16} aria-hidden="true"/><span class="sr-only">{$t.timezone}</span><bdi>{eventZone}</bdi></span>
   </div>
  </div>
  {#if confirmed}
-  {@const yours=zones.viewerTime(confirmed)}
+  {@const yours=viewerTime(confirmed)}
   <div class="event-confirmed flex flex-wrap items-center justify-between gap-3">
-   <div><strong>{$t.confirmedDate}: {formatDate(confirmed.date,$lang)}</strong><br/>{formatTime(confirmed.start,$lang)}{confirmed.end?' – '+formatTime(confirmed.end,$lang):''} · <span title={event.timezone}>{zones.event}</span>
-    {#if yours}<small class="zone-hint">{$t.yourTime}: {yours} · {zones.local}</small>{/if}</div>
+   <div><strong>{$t.confirmedDate}: {formatDate(confirmed.date,$lang)}</strong><br/>{formatTime(confirmed.start,$lang)}{confirmed.end?' – '+formatTime(confirmed.end,$lang):''} · <span title={event.timezone}>{eventZone}</span>
+    {#if yours}<small class="zone-hint">{$t.yourTime}: {yours} · {localZone}</small>{/if}</div>
    <a class="button btn-outline gap-2" href={calendarHref} download="frizzi.ics"><CalendarDays size={16}/>{$t.addCalendar}</a>
   </div>
  {:else if event.status==='OPEN' && event.voting_deadline}
@@ -80,7 +87,7 @@
    <div>
     <span class="deadline-label">{$t.votingDeadline}</span>
     <strong><time datetime={event.voting_deadline}>{formatDate(event.voting_deadline,$lang)}</time></strong>
-    <small>{$t.deadlineHint} (<span title={event.timezone}>{zones.event}</span>)</small>
+    <small>{$t.deadlineHint} (<span title={event.timezone}>{eventZone}</span>)</small>
    </div>
   </div>
  {/if}

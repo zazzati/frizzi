@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { cn } from './utils.ts';
+import { describe, expect, it, vi } from 'vitest';
+import { cn, onSubmit } from './utils.ts';
 
 describe('cn', () => {
     it('joins conditional class names', () => {
@@ -16,5 +16,15 @@ describe('cn', () => {
 
     it('returns an empty string without classes', () => {
         expect(cn()).toBe('');
+    });
+});
+
+describe('onSubmit', () => {
+    it('prevents the browser submission and runs the handler', () => {
+        const handler = vi.fn(() => Promise.resolve());
+        const event = { preventDefault: vi.fn() } as unknown as SubmitEvent;
+        onSubmit(handler)(event);
+        expect(event.preventDefault).toHaveBeenCalledOnce();
+        expect(handler).toHaveBeenCalledOnce();
     });
 });

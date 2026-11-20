@@ -3,7 +3,7 @@
  import { Button } from '#lib/components/ui/button/index.ts';
  import type { Question } from '#lib/types.ts';
  let dialog: HTMLDialogElement;
- let question: Question = { title: '', text: '', confirm: '', cancel: '' };
+ let question = $state<Question>({ title: '', text: '', confirm: '', cancel: '' });
  let answer: ((confirmed: boolean) => void) | undefined;
  let trigger: HTMLElement | null = null;
 
@@ -25,7 +25,7 @@
  }
 </script>
 
-<dialog class="confirm-dialog" bind:this={dialog} aria-labelledby="confirm-dialog-title" aria-describedby="confirm-dialog-text" on:close={closed}>
+<dialog class="confirm-dialog" bind:this={dialog} aria-labelledby="confirm-dialog-title" aria-describedby="confirm-dialog-text" onclose={closed}>
  <form method="dialog">
   <h2 id="confirm-dialog-title">{question.title}</h2>
   <p id="confirm-dialog-text">{#if question.detail}<strong>{question.detail}</strong><br/>{/if}{question.text}</p>

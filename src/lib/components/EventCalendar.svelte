@@ -5,21 +5,27 @@
  import { dateTimeFormat, numberFormat } from '#lib/intl.ts';
  import type { Slot } from '#lib/types.ts';
 
- export let slots: Slot[];
- export let selected: string[] = [];
- export let confirmedId: string | null = null;
- export let month = '';
- export let interactive = true;
- export let busy = false;
- export let choose: (id: string) => void;
- /** When the same dates are listed as controls below, the calendar is a pointer shortcut only:
-  *  hidden from assistive technology and out of the tab order, so each date is announced once. */
- export let mirrored = false;
- /** Legend for the marked days: the person's choices, or the date the organizer is looking at. */
- export let markedLabel = '';
- /** Availability per slot id; with participants, days are tinted by their share and show their count. */
- export let counts: Map<string, number> = new Map();
- export let total = 0;
+ type Props = {
+   slots: Slot[];
+   selected?: string[];
+   confirmedId?: string | null;
+   month?: string;
+   interactive?: boolean;
+   busy?: boolean;
+   choose: (id: string) => void;
+   /** When the same dates are listed as controls below, the calendar is a pointer shortcut only:
+    *  hidden from assistive technology and out of the tab order, so each date is announced once. */
+   mirrored?: boolean;
+   /** Legend for the marked days: the person's choices, or the date the organizer is looking at. */
+   markedLabel?: string;
+   /** Availability per slot id; with participants, days are tinted by their share and show their count. */
+   counts?: Map<string, number>;
+   total?: number;
+ };
+ let {
+   slots, selected = [], confirmedId = null, month = $bindable(''), interactive = true, busy = false, choose,
+   mirrored = false, markedLabel = '', counts = new Map(), total = 0
+ }: Props = $props();
 
  function monthDays(month: string, firstDay: number) {
    const date = new Date(`${month}-01T12:00:00Z`);
@@ -32,31 +38,31 @@
    });
  }
 
- $: language = $lang || 'it';
- $: locale = intlLocale(language);
- $: months = [...new Set(slots.map(slot => slot.date.slice(0, 7)))].sort();
- $: shownMonth = months.includes(month) ? month : months[0];
- $: monthIndex = months.indexOf(shownMonth);
- $: days = shownMonth ? monthDays(shownMonth, firstWeekday(locale)) : [];
- $: slotsByDay = new Map(slots.map(slot => [slot.date, slot]));
- $: weekdays = Array.from({length: 7}, (_, index) => {
+ const language = $derived($lang || 'it');
+ const locale = $derived(intlLocale(language));
+ const months = $derived([...new Set(slots.map(slot => slot.date.slice(0, 7)))].sort());
+ const shownMonth = $derived(months.includes(month) ? month : months[0]);
+ const monthIndex = $derived(months.indexOf(shownMonth));
+ const days = $derived(shownMonth ? monthDays(shownMonth, firstWeekday(locale)) : []);
+ const slotsByDay = $derived(new Map(slots.map(slot => [slot.date, slot])));
+ const weekdays = $derived(Array.from({length: 7}, (_, index) => {
    const weekday = new Date(Date.UTC(2024, 0, 7 + (firstWeekday(locale) + index) % 7));
    return dateTimeFormat(locale, {weekday:'short', timeZone:'UTC'}).format(weekday);
- });
- $: monthTitle = shownMonth ? dateTimeFormat(locale, {
+ }));
+ const monthTitle = $derived(shownMonth ? dateTimeFormat(locale, {
    month:'long', year:'numeric', timeZone:'UTC', calendar:'gregory'
- }).format(new Date(`${shownMonth}-01T12:00:00Z`)) : '';
- $: numbers = numberFormat(locale);
+ }).format(new Date(`${shownMonth}-01T12:00:00Z`)) : '');
+ const numbers = $derived(numberFormat(locale));
 </script>
 
 {#if shownMonth}
  <section class="event-calendar" aria-label={mirrored ? undefined : $t.eventCalendar} aria-hidden={mirrored || undefined}>
   <div class="calendar-month">
    <button type="button" aria-label={$t.previousMonth} disabled={monthIndex<=0} tabindex={mirrored ? -1 : undefined}
-     on:click={()=>month=months[monthIndex-1]}><ChevronLeft size={18} class="rtl:rotate-180" aria-hidden="true"/></button>
+     onclick={()=>month=months[monthIndex-1]}><ChevronLeft size={18} class="rtl:rotate-180" aria-hidden="true"/></button>
    <strong aria-live={mirrored ? undefined : 'polite'}>{monthTitle}</strong>
    <button type="button" aria-label={$t.nextMonth} disabled={monthIndex>=months.length-1} tabindex={mirrored ? -1 : undefined}
-     on:click={()=>month=months[monthIndex+1]}><ChevronRight size={18} class="rtl:rotate-180" aria-hidden="true"/></button>
+     onclick={()=>month=months[monthIndex+1]}><ChevronRight size={18} class="rtl:rotate-180" aria-hidden="true"/></button>
   </div>
   <div class="calendar-grid">
    {#each weekdays as weekday}
@@ -74,7 +80,7 @@
      {#if interactive}
       <button type="button" class="calendar-day proposed" class:marked={pressed} class:confirmed style:--share={share}
         data-calendar-date={day} aria-label={label} aria-pressed={pressed} title={label} disabled={busy} tabindex={mirrored ? -1 : undefined}
-        on:click={()=>choose(slot.id)}>{dayNumber}{#if count}<span class="day-count" aria-hidden="true">{numbers.format(count)}</span>{/if}</button>
+        onclick={()=>choose(slot.id)}>{dayNumber}{#if count}<span class="day-count" aria-hidden="true">{numbers.format(count)}</span>{/if}</button>
      {:else}
       <span class="calendar-day proposed" class:marked={pressed} class:confirmed style:--share={share}
         data-calendar-date={day} title={label}>
