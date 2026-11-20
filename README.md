@@ -73,19 +73,25 @@ The JSON dictionaries in `locales/` are shared by `svelte-i18n` and `rust-i18n`.
 
 ## Location autocomplete
 
-Set `GEOAPIFY_API_KEY` in your local `.env` or in your hosting provider’s server-side environment variables. The backend limits autocomplete to 120 searches per hour across the database. Consider this limit alongside any other projects that share the provider quota. Organisers can enter addresses, venue names and links manually when autocomplete is unavailable.
+Set `GEOAPIFY_API_KEY` in your local `.env` or in your hosting provider’s server-side environment variables. The backend limits autocomplete to 30 searches per hour for each client address and 120 per hour across the database. Consider this limit alongside any other projects that share the provider quota. Organisers can enter addresses, venue names and links manually when autocomplete is unavailable.
 
 ## Email delivery
 
-Frizzi saves email jobs in the same database transaction as the operation that triggered them. Delivery starts after the transaction commits. If SMTP or Resend fails, the job stays in the queue and Frizzi retries with increasing delays. The local worker checks the queue every ten seconds. On Vercel, the included cron is scheduled for 06:00 UTC daily. More frequent retries require a scheduler supported by your hosting plan.
+Frizzi saves email jobs in the same database transaction as the operation that triggered them. Delivery starts after the transaction commits. If SMTP or Resend fails, the job stays in the queue and Frizzi retries with increasing delays (30 seconds, doubling up to one hour). The local worker checks the queue every ten seconds. On Vercel there is no background worker: queued jobs are only retried after a write request (creating an event, voting, editing, sending a message) and by the included cron, scheduled for 06:00 UTC daily. More frequent retries require a scheduler supported by your hosting plan.
 
-`GET /api/cron/email` requires `Authorization: Bearer <CRON_SECRET>` and processes up to 25 messages per call. Resend receives an idempotency key to reduce duplicates. SMTP provides at-least-once delivery, so an interruption between sending and recording success may result in a duplicate. Frizzi removes recipient addresses and links from the queue after successful submission to the provider.
+`SMTP_TLS` sets the SMTP encryption to `none`, `starttls` or `tls` (implicit TLS). When it is unset, Frizzi sends to a local server such as Mailpit without TLS, uses implicit TLS on port 465 and requires STARTTLS for any other host, on port 587 unless `SMTP_PORT` says otherwise. Set `SMTP_TLS=none` for a relay on a private network or a Docker service name. Frizzi signs in with `SMTP_USERNAME` and `SMTP_PASSWORD` when both are set.
+
+A job is marked as failed and no longer retried after 12 attempts, or immediately when the provider rejects the message itself (an SMTP 5xx reply other than an authentication error, or a Resend 4xx response other than 401, 403, 408, 409 and 429). Each failure is logged as a `mail_failed` event.
+
+`GET /api/cron/email` requires `Authorization: Bearer <CRON_SECRET>` and processes up to 25 messages per call. Resend receives an idempotency key to reduce duplicates. SMTP provides at-least-once delivery, so an interruption between sending and recording success may result in a duplicate. Frizzi removes recipient addresses and links from the queue after successful submission to the provider or after a job is marked as failed.
 
 Changing a proposed date or time clears the votes for that option and reopens the poll. Changing the time zone clears all votes. Unchanged options keep their votes. Switching to single-choice voting requires updating any existing responses that selected multiple dates.
 
 ## Environment variables
 
 [`.env.example`](.env.example) lists the server-side environment variables and safe development defaults. Keep real credentials in a local `.env` file with permissions `0600` or in your hosting provider’s secret store. The Docker database and test mailbox bind only to loopback.
+
+The API applies hourly rate limits per client address, per email address and per event. On Vercel it reads the client address from `X-Real-IP` or `X-Forwarded-For`. Behind a reverse proxy on the same host, it uses the last `X-Forwarded-For` entry, which that proxy added, or `X-Real-IP` when there is no `X-Forwarded-For`. Set `FRIZZI_TRUST_PROXY=1` when the proxy runs on another machine, or `0` to always use the connecting address. `FRIZZI_RATE_LIMIT_SCALE` multiplies the per-address limits. IPv6 clients share a limit for each /64 network.
 
 To enable PDF invitations, set `FRIZZI_TYPST` and `FRIZZI_PDF_FONTS`. The [Typst setup script](deploy/setup-invitation-pdf.py) installs the renderer and fonts on Linux x86-64. Frizzi sends the HTML and plain-text confirmation when Typst is unavailable.
 
@@ -106,6 +112,8 @@ If Chromium’s dependencies are missing on Linux, install them with `npx playwr
 `npm run test:unit` runs the Vitest unit tests for the pure frontend logic in `src/lib` (date entry, poll results, error messages) and checks that every locale has the same keys. It needs no services. `npm run coverage` runs the same tests and writes a coverage report to `coverage/`.
 
 `npm test` starts a temporary PostgreSQL 16 database, Mailpit, the Rust API and Vite on dedicated ports. Integration tests cover event creation, privacy, authorisation, isolation between events, voting, edits, localised notifications and SMTP retries. Browser checks cover all eleven languages, right-to-left layout, language persistence, the event workflow and mobile rendering. Screenshots go to `test-results/`. Test emails stay in the local Mailpit inbox.
+
+The suite uses `$MAILPIT` or a `mailpit` on `PATH`, and otherwise `npm run test:setup` downloads a hash-verified release for Linux or macOS (x86-64 or arm64). `CARGO` overrides the `cargo` on `PATH`. Set `FRIZZI_TEST_PG_PORT`, `FRIZZI_TEST_SMTP_PORT`, `FRIZZI_TEST_MAIL_UI_PORT`, `FRIZZI_TEST_API_PORT` or `FRIZZI_TEST_WEB_PORT` to move a service off its default port. `FRIZZI_TEST_TIMEOUT_SCALE` (for example `2`) stretches the wait budgets on slow machines, and `FRIZZI_TEST_WATCHDOG_MS` (default 15 minutes) caps the run. On failure, the suite saves a screenshot and a Playwright trace of each open page in `test-results/`. Ctrl-C stops every service and removes the temporary data.
 
 ## Retention
 

@@ -30,5 +30,10 @@ async fn main() {
         .await
         .expect("API port unavailable");
     tracing::info!(event = "api_started", address);
-    axum::serve(listener, frizzi::router(pool)).await.unwrap();
+    axum::serve(
+        listener,
+        frizzi::router(pool).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }

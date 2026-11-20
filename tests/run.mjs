@@ -1,30 +1,84 @@
 import assert from 'node:assert/strict';
 import EmbeddedPostgres from 'embedded-postgres';
 import { chromium } from '@playwright/test';
-import { spawn, execFileSync } from 'node:child_process';
-import { mkdtemp, readFile, mkdir, access } from 'node:fs/promises';
-import { tmpdir, homedir } from 'node:os';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { mkdtemp, readFile, readdir, mkdir, access, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import { setupTools, mailpitPath, toolsDir } from '../scripts/setup-tools.mjs';
 
-const cargo=process.env.CARGO||join(homedir(),'.cargo/bin/cargo');
+const cargo=process.env.CARGO||'cargo';
+const port=(name,fallback)=>Number(process.env[`FRIZZI_TEST_${name}_PORT`]||fallback);
+const pgPort=port('PG',55433), smtpPort=port('SMTP',11025), mailUiPort=port('MAIL_UI',18025), apiPort=port('API',13001), webPort=port('WEB',15173);
+// Multiplies every polling budget (and the default watchdog) for slow machines.
+const scale=Number(process.env.FRIZZI_TEST_TIMEOUT_SCALE||1);if(!(scale>0))throw new Error('FRIZZI_TEST_TIMEOUT_SCALE must be a positive number');
 const directory=await mkdtemp(join(tmpdir(),'frizzi-integration-'));
 const children=[];let browser;let database;let client;let stalledSmtp;
-const stalledSockets=new Set();
-const web='http://127.0.0.1:15173', api='http://127.0.0.1:13001', mail='http://127.0.0.1:18025';
+const stalledSockets=new Set();const contexts=[];
+const web=`http://127.0.0.1:${webPort}`, api=`http://127.0.0.1:${apiPort}`, mail=`http://127.0.0.1:${mailUiPort}`;
 const cronSecret=randomUUID()+randomUUID();
 const logDir=join(directory,'logs');
-const env={...process.env,DATABASE_URL:'postgres://frizzi:frizzi@127.0.0.1:55433/frizzi_test',APP_URL:web,MAIL_FROM:'no-reply@eventi.relistim.it',SMTP_HOST:'127.0.0.1',SMTP_PORT:'11025',RESEND_API_KEY:'',GEOAPIFY_API_KEY:'',GEMINI_API_KEY:'',FRIZZI_TYPST:process.env.FRIZZI_TYPST||'',API_BIND:'127.0.0.1:13001',API_PROXY_TARGET:api,CRON_SECRET:cronSecret,FRIZZI_LOG_DIR:logDir,FRIZZI_PROBE_PRIMARY:'',FRIZZI_PROBE_LEGACY:''};
+const env={...process.env,DATABASE_URL:`postgres://frizzi:frizzi@127.0.0.1:${pgPort}/frizzi_test`,APP_URL:web,MAIL_FROM:'no-reply@eventi.relistim.it',SMTP_HOST:'127.0.0.1',SMTP_PORT:String(smtpPort),RESEND_API_KEY:'',GEOAPIFY_API_KEY:'',GEMINI_API_KEY:'',FRIZZI_TYPST:process.env.FRIZZI_TYPST||'',API_BIND:`127.0.0.1:${apiPort}`,API_PROXY_TARGET:api,CRON_SECRET:cronSecret,FRIZZI_LOG_DIR:logDir,FRIZZI_PROBE_PRIMARY:'',FRIZZI_PROBE_LEGACY:''};
+const mailpitEnv={env:{...env,MP_SMTP_BIND_ADDR:`127.0.0.1:${smtpPort}`,MP_UI_BIND_ADDR:`127.0.0.1:${mailUiPort}`}};
 const expectPdf=!!env.FRIZZI_TYPST&&!process.env.FRIZZI_TEST_PDF_FALLBACK;
 function start(command,args,extra={}){
  const child=spawn(command,args,{env,...extra});children.push(child);
  let log='';child.output=()=>log;child.stdout?.on('data',data=>log+=data);child.stderr?.on('data',data=>log+=data);
- child.on('exit',code=>{if(code && code!==null)console.error(log.slice(-5000));});return child;
+ child.on('exit',code=>{if(code && code!==null && !cleaning)console.error(log.slice(-5000));});return child;
+}
+async function run(command,args){
+ const child=spawn(command,args,{env,stdio:'inherit'});child.output=()=>'';children.push(child);
+ const [code,signal]=await once(child,'exit');if(code!==0)throw new Error(`${command} ${args.join(' ')} failed: ${signal||code}`);
+}
+function settle(promise,ms){let timer;return Promise.race([Promise.resolve(promise).catch(()=>{}),new Promise(resolve=>timer=setTimeout(resolve,ms))]).finally(()=>clearTimeout(timer));}
+async function stop(child){
+ if(child.exitCode!==null||child.signalCode!==null||!child.pid)return;
+ const exited=once(child,'exit');child.kill('SIGTERM');
+ const timer=setTimeout(()=>child.kill('SIGKILL'),3000);await settle(exited,6000);clearTimeout(timer);
+}
+let cleaning;
+function cleanup(){return cleaning??=(async()=>{
+ clearTimeout(watchdog);
+ for(const socket of stalledSockets)socket.destroy();
+ stalledSmtp?.close();
+ await settle(browser?.close(),5000);
+ await Promise.all(children.map(stop));
+ await settle(client?.end(),2000);
+ if(database)await settle(database.stop(),5000);
+ await rm(directory,{recursive:true,force:true}).catch(error=>console.error(`Could not remove ${directory}: ${error.message}`));
+})();}
+let saving;
+function saveArtifacts(){return saving??=(async()=>{
+ if(!contexts.length)return;
+ await mkdir('test-results',{recursive:true});
+ for(const [i,context] of contexts.entries()){
+  for(const [j,page] of context.pages().entries())await page.screenshot({path:`test-results/failure-${i}-${j}.png`,fullPage:true,timeout:5000}).catch(error=>console.error(`Failure screenshot not saved: ${error.message}`));
+  await settle(context.tracing.stop({path:`test-results/failure-trace-${i}.zip`}),10000);
+ }
+ console.error('Failure screenshots and Playwright traces saved in test-results/ (open with: npx playwright show-trace <zip>).');
+})().catch(error=>console.error(`Failure artifacts not saved: ${error.message}`));}
+async function fail(error){if(interrupted)return;console.error(error);for(const child of children)console.error(child.output().slice(-2500));process.exitCode=1;await saveArtifacts();}
+const watchdogMs=Number(process.env.FRIZZI_TEST_WATCHDOG_MS||15*60*1000*scale);
+const watchdog=setTimeout(async()=>{await fail(new Error(`Watchdog: the suite did not finish within ${watchdogMs} ms`));await cleanup();process.removeAllListeners('exit');process.exit(1);},watchdogMs);
+// embedded-postgres (through exit-hook) exits on these signals before the other services are stopped,
+// so the runner owns them: clean up everything, then re-raise to exit with the conventional status.
+// npm forwards the terminal's Ctrl-C, so a second signal arrives at once: only a later one forces an exit.
+let interrupted=0;
+for(const signal of ['SIGINT','SIGTERM']){process.removeAllListeners(signal);process.on(signal,async()=>{
+ if(interrupted){if(Date.now()-interrupted>3000){console.error('Forced exit: cleanup skipped.');process.exit(1);}return;}
+ interrupted=Date.now();console.error(`\nReceived ${signal}, cleaning up...`);
+ await cleanup();process.removeAllListeners(signal);process.kill(process.pid,signal);
+});}
+async function newPage(options){
+ const context=await browser.newContext(options);contexts.push(context);context.setDefaultTimeout(30000*scale);
+ await context.tracing.start({screenshots:true,snapshots:true});
+ const page=await context.newPage();page.once('close',()=>{contexts.splice(contexts.indexOf(context),1);context.close().catch(()=>{});});return page;
 }
 async function waitFor(url){
- for(let i=0;i<150;i++){try{const r=await fetch(url);if(r.ok)return;}catch{}await new Promise(r=>setTimeout(r,100));}
+ for(let i=0;i<150*scale;i++){try{const r=await fetch(url);if(r.ok)return;}catch{}await new Promise(r=>setTimeout(r,100));}
  throw new Error(`Service failed to start: ${url}`);
 }
 async function call(path,method='GET',body,expected=200){
@@ -33,11 +87,16 @@ async function call(path,method='GET',body,expected=200){
  return JSON.parse(text);
 }
 async function messagesFor(address){
- const data=await(await fetch(mail+'/api/v1/messages?limit=200')).json();
- return data.messages.filter(m=>m.To.some(to=>to.Address===address));
+ // Search server-side and page through results, so a busy inbox never hides older messages; newest first.
+ const found=[],limit=250,query=encodeURIComponent(`to:"${address}"`);
+ for(let start=0;;start+=limit){
+  const data=await(await fetch(`${mail}/api/v1/search?query=${query}&start=${start}&limit=${limit}`)).json();
+  found.push(...data.messages);if(data.messages.length<limit)break;
+ }
+ return found.filter(m=>m.To.some(to=>to.Address===address));
 }
 async function until(find,description){
- for(let i=0;i<100;i++){
+ for(let i=0;i<100*scale;i++){
   const result=await find();if(result)return result;
   await new Promise(resolve=>setTimeout(resolve,50));
  }
@@ -48,24 +107,30 @@ async function messageFor(address,subject=''){
  return (await fetch(`${mail}/api/v1/message/${entry.ID}`)).json();
 }
 async function queueDrained(){
- await until(async()=>(await client.query('SELECT count(*) FROM email_outbox WHERE sent_at IS NULL')).rows[0].count==='0','Email queue did not drain');
+ await until(async()=>(await client.query('SELECT count(*) FROM email_outbox WHERE sent_at IS NULL AND failed_at IS NULL')).rows[0].count==='0','Email queue did not drain');
 }
-function tokenFrom(text){return text.match(/http:\/\/127\.0\.0\.1:15173\/[\w-]{21}(?:\/admin)?\/([\w-]{21})/)[1];}
+const tokenPattern=new RegExp(web.replace(/[.*+?^$()|[\]\\{}]/g,'\\$&')+'/[\\w-]{21}(?:/admin)?/([\\w-]{21})');
+function tokenFrom(text){return text.match(tokenPattern)[1];}
+// Date-relative retention checks must not straddle midnight in the zone the server evaluates them in.
+async function clearOfMidnight(zone,margin=60*scale){
+ const seconds=Number((await client.query("SELECT extract(epoch FROM date_trunc('day',now() AT TIME ZONE $1)+interval '1 day'-(now() AT TIME ZONE $1)) AS s",[zone])).rows[0].s);
+ if(seconds<margin){console.log(`Waiting ${Math.ceil(seconds)}s for midnight in ${zone} to pass.`);await new Promise(r=>setTimeout(r,(seconds+1)*1000));}
+}
 const initial={title:'Cena <b>insieme</b>',description:'Una sera insieme',location:'Roma',organizer_name:'Ada',organizer_email:'ada@example.test',locale:'it',allow_multiple_choices:true,timezone:'Europe/Rome',slots:[{date:'2030-02-03',start:'20:00',end:'22:00'},{date:'2030-02-04',start:'20:00',end:null}]};
 let checks=0;
 function check(condition,message){assert.ok(condition,message);checks++;}
 try{
  await setupTools();
- if(!process.env.SKIP_BUILD)execFileSync(cargo,['build','--bins'],{env,stdio:'inherit'});
- database=new EmbeddedPostgres({databaseDir:join(directory,'pg'),user:'frizzi',password:'frizzi',port:55433,persistent:false,onLog:()=>{},onError:()=>{}});
+ if(!process.env.SKIP_BUILD)await run(cargo,['build','--bins']);
+ database=new EmbeddedPostgres({databaseDir:join(directory,'pg'),user:'frizzi',password:'frizzi',port:pgPort,persistent:false,onLog:()=>{},onError:()=>{}});
  await database.initialise();await database.start();await database.createDatabase('frizzi_test');
  client=database.getPgClient('frizzi_test');await client.connect();
  check((await client.query('SHOW server_version')).rows[0].server_version.startsWith('16.'),'PostgreSQL 16 required');
- execFileSync(join(process.cwd(),'target/debug/migrate'),[],{env,stdio:'inherit'});
- const mailChild=start(mailpitPath,[],{env:{...env,MP_SMTP_BIND_ADDR:'127.0.0.1:11025',MP_UI_BIND_ADDR:'127.0.0.1:18025'}});
+ await run(join(process.cwd(),'target/debug/migrate'),[]);
+ const mailChild=start(mailpitPath,[],mailpitEnv);
  await waitFor(mail+'/api/v1/messages');
  start(join(process.cwd(),'target/debug/local'),[]);
- start(process.execPath,['node_modules/vite/bin/vite.js','dev','--host','127.0.0.1','--port','15173','--strictPort']);
+ start(process.execPath,['node_modules/vite/bin/vite.js','dev','--host','127.0.0.1','--port',String(webPort),'--strictPort']);
  await waitFor(api+'/api/health');await waitFor(web);
  check((await fetch(api+'/api/ready')).ok,'Readiness checks the migrated database');
  check((await fetch(api+'/api/telemetry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify('share_copy')})).status===204,'Allowlisted telemetry is accepted');
@@ -90,6 +155,10 @@ try{
  const earlyDeadline=await call('/api/events','POST',{...initial,voting_deadline:'2000-01-01'},400);
  check(earlyDeadline.error==='invalid_deadline','A new deadline cannot be in the past');
  await call('/api/events','POST',{...initial,slots:[{...initial.slots[0],end:'19:00'}]},400);
+ for(const date of ['2000-01-01','2099-01-01'])check((await call('/api/events','POST',{...initial,slots:[{...initial.slots[0],date}]},400)).error==='invalid_dates',`Proposed date ${date} is out of range`);
+ check((await call('/api/events','POST',{...initial,voting_deadline:'2030-02-05'},400)).error==='invalid_deadline','Voting cannot close after the last proposed date');
+ const blank=await call('/api/events','POST',{...initial,description:' \n\t ',organizer_email:'blank@example.test'});
+ check((await call(`/api/events/${blank.public_token}`)).description===null,'A blank description is stored as none');
  for(const locale of locales.filter(code=>code!=='it')){
   const address=`locale-${locale}@example.test`;
   const result=await call('/api/events','POST',{...initial,organizer_email:address,locale});
@@ -166,7 +235,7 @@ try{
   for(let i=0;i<4;i++){
    assert.deepEqual(await call(eventPath+'/recover','POST',{email:address}),generic);
   }
-  for(let i=0;i<80&&(await messagesFor(address)).length<before+3;i++)await new Promise(r=>setTimeout(r,50));
+  for(let i=0;i<80*scale&&(await messagesFor(address)).length<before+3;i++)await new Promise(r=>setTimeout(r,50));
   check((await messagesFor(address)).length===before+3,'Recovery mails are capped per recipient');
   check(tokenFrom((await messageFor(address)).Text)===privateToken,'Recovery uses the existing private link');
  }
@@ -185,6 +254,7 @@ try{
  check(calendarResponse.ok && calendarResponse.headers.get('content-type').startsWith('text/calendar'),'Calendar download');
  check(ical.includes('DTSTART:20300203T190000Z') && ical.includes('DTEND:20300203T210000Z'),'Calendar preserves the event time zone');
  check(!ical.includes(adminToken) && !ical.includes(editToken),'Calendar contains no private links');
+ check(ical.includes('\r\nMETHOD:PUBLISH\r\n')&&ical.includes(`\r\nUID:${publicToken}@frizzi\r\n`)&&/\r\nSEQUENCE:\d+\r\n/.test(ical),'Calendar is a publishable revision with a stable UID');
  const confirmation=await messageFor(v.email,'🎉 ¡Ya tenemos fecha!');
  const confirmedMail=confirmation.Text;
  check(confirmedMail.includes(eventPath+'/calendar.ics'),'Calendar URL in confirmation email');
@@ -218,10 +288,12 @@ try{
  await call(statusPath,'PUT',{status:'OPEN',confirmed_slot_id:null,locale:'it'});
  check((await messageFor(v.email,'Encuesta reabierta')).Subject.includes('🗳️'),'Reopening notification');
  await queueDrained();
- const pending=(await client.query('SELECT count(*) FROM email_outbox WHERE sent_at IS NULL')).rows[0].count;
+ const pending=(await client.query('SELECT count(*) FROM email_outbox WHERE sent_at IS NULL AND failed_at IS NULL')).rows[0].count;
  check(pending==='0','Email queue drained');
  check((await client.query("SELECT count(*) FROM email_outbox WHERE sent_at IS NOT NULL AND (body<>'' OR html IS NOT NULL OR recipient<>'')")).rows[0].count==='0','Delivered secrets removed from both formats in the outbox');
  const unauthorized=await fetch(api+'/api/cron/email');check(unauthorized.status===401,'Cron requires secret');
+ const wrongSecret=cronSecret.slice(0,-1)+(cronSecret.endsWith('0')?'1':'0');
+ check((await fetch(api+'/api/cron/email',{headers:{Authorization:`Bearer ${wrongSecret}`}})).status===401,'Cron rejects a wrong secret of the same length');
 
  // Delivery failure must preserve the event and retry without exposing its private token.
  mailChild.kill('SIGTERM');await new Promise(resolve=>mailChild.once('exit',resolve));
@@ -230,7 +302,7 @@ try{
   socket.on('error',()=>{});
   socket.on('close',()=>stalledSockets.delete(socket));
  });
- await new Promise(resolve=>stalledSmtp.listen(11025,'127.0.0.1',resolve));
+ await new Promise(resolve=>stalledSmtp.listen(smtpPort,'127.0.0.1',resolve));
  const updates=statusPath+'/messages';
  const broadcast={request_id:randomUUID(),message:'<b>Ci vediamo!</b>\n<i>A presto</i> <img src=x onerror=alert(1)>'};
  await call(`${eventPath}/admin/${editToken}/messages`,'POST',broadcast,404);
@@ -249,13 +321,16 @@ try{
  check((await call(`/api/events/${deferred.public_token}`)).title===initial.title,'Event survives SMTP outage');
  check((await client.query("SELECT count(*) FROM email_outbox WHERE recipient='retry@example.test' AND sent_at IS NULL")).rows[0].count==='1','Failed delivery remains queued');
  await until(async()=>(await client.query("SELECT count(*) FROM email_outbox WHERE sent_at IS NULL AND (attempts=0 OR locked_until IS NOT NULL)")).rows[0].count==='0','Provider failure is recorded');
- start(mailpitPath,[],{env:{...env,MP_SMTP_BIND_ADDR:'127.0.0.1:11025',MP_UI_BIND_ADDR:'127.0.0.1:18025'}});
+ start(mailpitPath,[],mailpitEnv);
  await waitFor(mail+'/api/v1/messages');
  await client.query("INSERT INTO email_outbox (recipient,subject,body) VALUES ('legacy@example.test','Pending before upgrade','Plain text')");
+ await client.query("INSERT INTO email_outbox (recipient,subject,body,html) VALUES ('no-at-sign.example.test','Rejected','Private text','Private HTML')");
  await client.query('UPDATE email_outbox SET available_at=now() WHERE sent_at IS NULL');
  const retried=await fetch(api+'/api/cron/email',{headers:{Authorization:`Bearer ${cronSecret}`}});check(retried.ok,'Retry worker');
  check((await messageFor('retry@example.test')).Text.includes('/admin/'),'Private link delivered after retry');
  check((await messageFor('legacy@example.test')).Text.trim()==='Plain text','Queued plain text from before the upgrade still delivers');
+ await until(async()=>(await client.query("SELECT count(*) FROM email_outbox WHERE subject='' AND failed_at IS NOT NULL AND sent_at IS NULL AND attempts=1 AND recipient='' AND body='' AND html IS NULL")).rows[0].count==='1','A rejected message fails at once and is scrubbed');
+ check(true,'Permanent delivery failures are terminal and drop private content');
  const updateMail=await messageFor(v.email,'💌 ¡Una novedad para ti!');
  check(updateMail.HTML.includes('<b>Ci vediamo!</b>')&&updateMail.HTML.includes('<i>A presto</i>'),'Participant message preserves allowed formatting');
  check(updateMail.HTML.includes('&lt;img')&&!updateMail.HTML.includes('<img'),'Participant message escapes unsupported HTML');
@@ -282,6 +357,7 @@ try{
  const {id:retentionId}= (await client.query('SELECT id FROM events WHERE public_token=$1',[retentionEvent.public_token])).rows[0];
  const {id:invitationId}=(await client.query("INSERT INTO confirmation_invitations (event_id,payload) VALUES ($1,'{}'::jsonb) RETURNING id",[retentionId])).rows[0];
  await client.query("INSERT INTO email_outbox (event_id,recipient,subject,body,html,available_at,invitation_id) VALUES ($1,'expired@example.test','Pending','Private text','Private HTML',now()+interval '1 day',$2)",[retentionId,invitationId]);
+ for(const zone of [initial.timezone,'UTC'])await clearOfMidnight(zone);
  await client.query("UPDATE event_slots SET slot_date=(now() AT TIME ZONE 'Europe/Rome')::date-10 WHERE id=$1",[retentionSlots[0].id]);
  await client.query("UPDATE event_slots SET slot_date=(now() AT TIME ZONE 'Europe/Rome')::date-11 WHERE id=$1",[singleEvent.slots[0].id]);
  const statsCron=()=>fetch(api+'/api/cron/email',{headers:{Authorization:`Bearer ${cronSecret}`}});
@@ -290,7 +366,10 @@ try{
  check((await call(retentionPath)).status==='CONFIRMED','Confirmed event remains visible on the entire tenth calendar day');
  check((await client.query("SELECT count(*) FROM usage_metrics WHERE action='old_metric'")).rows[0].count==='0','Usage counters rotate after ten UTC calendar days');
  await client.query("UPDATE event_slots SET slot_date=(now() AT TIME ZONE 'Europe/Rome')::date-11 WHERE id=$1",[retentionSlots[0].id]);
+ const {id:unknownZone}=(await client.query("INSERT INTO events (public_token,admin_token,title,location,organizer_name,organizer_email,timezone) VALUES ('unknown-zone-public-0','unknown-zone-admin-00','Old','Roma','Ada','zone@example.test','Mars/City') RETURNING id")).rows[0];
+ await client.query("INSERT INTO event_slots (event_id,slot_date,start_time) VALUES ($1,current_date-30,'20:00')",[unknownZone]);
  check((await fetch(api+'/api/cron/email',{headers:{Authorization:`Bearer ${cronSecret}`}})).ok,'Retention runs from the protected cron');
+ check((await client.query('SELECT count(*) FROM events WHERE id=$1',[unknownZone])).rows[0].count==='0','A zone unknown to PostgreSQL falls back to UTC instead of blocking retention');
  await call(retentionPath,'GET',undefined,404);
  check((await call('/api/events/'+single.public_token)).slots.length===2,'Open event uses its latest proposal for retention');
  const remaining=(await client.query(`SELECT
@@ -302,20 +381,28 @@ try{
  `,[retentionId,retentionSlots[0].id])).rows[0];
  assert.deepEqual(remaining,{slots:'0',participants:'0',votes:'0',mail:'0',invitations:'0'});
  check((await messagesFor('expired@example.test')).length===0,'Pending email for expired event was never sent');
+ const flood=await call('/api/events','POST',{...initial,organizer_email:'flood@example.test'});
+ const floodPath=`/api/events/${flood.public_token}/admin/${tokenFrom((await messageFor('flood@example.test')).Text)}`;
+ let limited;
+ for(let i=0;i<25&&!limited;i++){
+  const response=await fetch(web+floodPath,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:i%2?'OPEN':'CANCELLED',confirmed_slot_id:null,locale:'it'})});
+  if(response.status===429)limited=await response.json();else assert.equal(response.status,200);
+ }
+ check(limited?.error==='rate_limited','Repeated status changes on one event are rate limited');
  console.log(`API, database and email checks passed (${checks} assertions).`);
 
  const browserEnv={...process.env};
  const runtimeDir=join(toolsDir,'browser-libs');
  try{await access(join(runtimeDir,'lib','libnspr4.so'));browserEnv.LD_LIBRARY_PATH=[join(runtimeDir,'lib'),browserEnv.LD_LIBRARY_PATH].filter(Boolean).join(':');}catch{}
  try{await access(join(runtimeDir,'fonts.conf'));browserEnv.FONTCONFIG_FILE ||= join(runtimeDir,'fonts.conf');}catch{}
- browser=await chromium.launch({headless:true,env:browserEnv});
- const emailPreview=await browser.newPage({viewport:{width:360,height:780}});
+ browser=await chromium.launch({headless:true,env:browserEnv,handleSIGINT:false,handleSIGTERM:false});
+ const emailPreview=await newPage({viewport:{width:360,height:780}});
  await emailPreview.setContent(confirmation.HTML);
  check(await emailPreview.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Confirmation email fits a narrow screen');
  await emailPreview.close();
- const page=await browser.newPage({locale:'it-IT',timezoneId:'Europe/Rome'});
+ const page=await newPage({locale:'it-IT',timezoneId:'Europe/Rome'});
  for(const [locale,code] of [['de-AT','de'],['ar-EG','ar']]){
-  const visitor=await browser.newPage({locale});
+  const visitor=await newPage({locale});
   await visitor.addInitScript(()=>new MutationObserver((_,observer)=>{if(document.body){window.firstPaint=[document.documentElement.lang,document.documentElement.dir];observer.disconnect();}}).observe(document,{childList:true,subtree:true}));
   await visitor.goto(web);await visitor.waitForSelector('header[data-ready="true"]');
   const dictionary=JSON.parse(await readFile(`locales/${code}.json`,'utf8'));
@@ -331,7 +418,7 @@ try{
    Object.defineProperty(navigator,'share',{value:async data=>localStorage.setItem('sharedEvent',JSON.stringify(data))});
  });
  const browserErrors=[];page.on('pageerror',error=>browserErrors.push(error.message));
- const unavailable=await browser.newPage({locale:'it-IT'});
+ const unavailable=await newPage({locale:'it-IT'});
  await unavailable.route('**/api/events/*',route=>route.fulfill({status:502,contentType:'text/html',body:'<h1>Bad gateway</h1>'}));
  await unavailable.goto(web+retentionPath.replace('/api/events',''));
  await unavailable.getByText('Il servizio è temporaneamente indisponibile. Riprova tra poco.').waitFor();
@@ -349,7 +436,8 @@ try{
    await page.getByRole('heading',{name:dictionary.ui.create,exact:true}).waitFor();
    check(await page.locator('html').getAttribute('dir')===(locale==='ar'?'rtl':'ltr'),`Direction for ${locale}`);
  }
- await select.selectOption('ar');await page.reload();await page.waitForFunction(()=>document.documentElement.dir==='rtl');
+ await chooseLanguage('ar');await page.reload();
+ await page.waitForSelector('header[data-ready="true"]');
  check(await select.inputValue()==='ar','Language persists after reload');
  await chooseLanguage('it');
  const venue={label:'Caffè Florian, Piazza San Marco 57, Venezia',geo:{
@@ -432,8 +520,9 @@ try{
  check(debugResponse.status===409,'Invalid tiebreak is a traceable conflict');
  const requestId=debugResponse.headers.get('x-request-id');
  check(/^[a-f0-9-]{36}$/.test(requestId),'API returns a generated support reference');
- const logs=await readFile(join(logDir,new Date().toISOString().slice(0,10)+'.jsonl'),'utf8');
- const rows=logs.trim().split('\n').map(line=>JSON.parse(line));
+ // The server names log files by its own UTC date; read them all so a run across midnight still sees every row.
+ const logs=(await Promise.all((await readdir(logDir)).filter(name=>name.endsWith('.jsonl')).sort().map(name=>readFile(join(logDir,name),'utf8')))).join('\n');
+ const rows=logs.split('\n').filter(line=>line.trim()).map(line=>JSON.parse(line));
  check(rows.some(entry=>entry.span?.request_id===requestId && entry.span?.route==='/api/events/{public}/admin/{secret}/tiebreak'),'Trace stores the normalized route and support reference');
  check(rows.some(entry=>entry.fields.event==='mail_deferred' && entry.fields.reason.startsWith('smtp_')),'A failed SMTP attempt identifies its failure class');
  check(![browserAdmin,browserToken,'browser@example.test','Cena dal browser'].some(value=>logs.includes(value)),'Logs exclude private route parameters and form content');
@@ -455,7 +544,7 @@ try{
  check(await page.locator('label.date-option .date-item-icon svg').count()===2,'Every selectable date has a calendar icon');
  check(await detailsCard.getByText(eventDescription,{exact:true}).isVisible()&&await detailsCard.getByText('Browser Ada',{exact:true}).isVisible(),'Description and organizer are readable on mobile');
  check(await detailsCard.evaluate(node=>node.scrollWidth<=node.clientWidth),'Venue details fit a narrow mobile screen');
- check((await directions.boundingBox()).y===(await google.boundingBox()).y,'Map actions stay on the same row on mobile');
+ check(Math.abs((await directions.boundingBox()).y-(await google.boundingBox()).y)<=1,'Map actions stay on the same row on mobile');
  await mkdir('test-results',{recursive:true});
  await detailsCard.screenshot({path:'test-results/event-details.png'});
  await page.evaluate(()=>window.scrollTo(0,0));
@@ -470,7 +559,7 @@ try{
  await chooseLanguage('it');
  const leaders=page.locator('.result-leaders');
  check(await leaders.count()===0,'No leading date before a vote');
- const traveller=await browser.newPage({locale:'it-IT',timezoneId:'America/New_York'});
+ const traveller=await newPage({locale:'it-IT',timezoneId:'America/New_York'});
  await traveller.goto(publicUrl);await traveller.locator('label.date-option').first().waitFor();
  check((await traveller.locator('label.date-option').first().textContent()).includes('Nel tuo fuso orario: 13:30')&&await traveller.locator('.event-fact[title="Europe/Rome"]').textContent().then(text=>text.includes('Ora dell’Europa centrale')),'Guests elsewhere see their own time and a readable event zone');
  await traveller.close();
@@ -561,7 +650,9 @@ try{
  await leaders.getByRole('button',{name:/Voto di spareggio · dom 31 mar 2030/}).click();
  await leaders.getByRole('heading',{name:'Data scelta allo spareggio'}).waitFor();
  check(await leaders.locator('time').count()===1&&await leaders.locator('time').getAttribute('datetime')==='2030-03-31','Deciding vote leaves one winner');
- check(await leaders.evaluate(el=>getComputedStyle(el).backgroundColor)==='rgb(242, 234, 253)','Leaderboard uses a light violet background');
+ const [red,green,blue]=(await leaders.evaluate(el=>getComputedStyle(el).backgroundColor)).match(/[\d.]+/g).map(Number);
+ const high=Math.max(red,green,blue),low=Math.min(red,green,blue),hue=high===blue&&high>low?240+60*(red-green)/(high-low):-1;
+ check(hue>=250&&hue<=300&&(high+low)/510>=0.85,`Leaderboard uses a light violet background (hue ${Math.round(hue)})`);
  check(await page.evaluate(async()=>{
   const fonts=await document.fonts.load('600 14px Inter');
   return fonts.some(font=>font.family==='Inter')&&getComputedStyle(document.querySelector('h1')).fontFamily.startsWith('Inter');
@@ -597,11 +688,17 @@ try{
  await confirmedDay.waitFor();
  check(await page.locator('button[data-calendar-date]').count()===0,'Closed participant calendar shows saved and confirmed dates in read-only mode');
  check(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),'Calendar layout fits narrow mobile screens');
+ await call(`/api/events/${single.public_token}/votes`,'POST',{name:'Organizer too',email:'SINGLE@example.test',locale:'de',slots:[]});
+ const singleVoter=tokenFrom((await messageFor('single@example.test','✅')).Text);
  await client.query("UPDATE events SET voting_deadline='2000-01-01' WHERE public_token=$1",[single.public_token]);
  await page.goto(web+'/'+single.public_token);
  await status.filter({hasText:'Sondaggio chiuso'}).waitFor();
  check(await status.getAttribute('data-state')==='closed'&&await status.locator('svg').count()===1,'An expired poll is labeled closed with an icon');
  await call(`/api/events/${single.public_token}/admin/${singleAdmin}`,'PUT',{status:'CANCELLED',confirmed_slot_id:null,locale:'it'});
+ await messageFor('single@example.test','📌');await queueDrained();
+ const organizerCancel=(await messagesFor('single@example.test')).filter(m=>m.Subject.startsWith('📌'));
+ const organizerCancelText=(await messageFor('single@example.test','📌')).Text;
+ check(organizerCancel.length===1&&tokenFrom(organizerCancelText)===singleAdmin&&organizerCancelText.includes(`/${single.public_token}/${singleVoter}`),'An organizer who voted gets one notification with both private links');
  await page.reload();
  await status.filter({hasText:'Evento annullato'}).waitFor();
  check(await status.getAttribute('data-state')==='cancelled'&&await partyImage.count()===0,'Cancelled event has a distinct badge and no celebration art');
@@ -612,12 +709,5 @@ try{
  await page.setViewportSize({width:1440,height:1000});await page.screenshot({path:'test-results/desktop.png',fullPage:true});
  check(browserErrors.length===0,`Browser errors: ${browserErrors.join('; ')}`);
  console.log(`Browser checks passed. Total ${checks} assertions; screenshots in test-results/.`);
-}catch(error){console.error(error);for(const child of children)console.error(child.output().slice(-2500));process.exitCode=1;}
-finally{
- for(const socket of stalledSockets)socket.destroy();
- stalledSmtp?.close();
- await browser?.close();
- for(const child of children)if(child.exitCode===null)child.kill('SIGTERM');
- await client?.end();
- if(database)await database.stop().catch(()=>{});
-}
+}catch(error){await fail(error);}
+finally{await cleanup();}

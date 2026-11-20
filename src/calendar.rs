@@ -6,7 +6,9 @@ use axum::{
 use chrono::{DateTime, Days, NaiveDateTime, Offset, TimeZone, Utc};
 use sqlx::{PgPool, Row};
 
-use crate::{bad, db, mail, missing, valid_token, ApiError};
+use crate::error::{bad, db, missing, ApiError};
+use crate::mail;
+use crate::validate::valid_token;
 
 pub async fn download(
     State(pool): State<PgPool>,
@@ -16,7 +18,7 @@ pub async fn download(
         return Err(missing());
     }
     let event = sqlx::query(
-        "SELECT e.title, e.location, e.description, e.timezone, e.updated_at,
+        "SELECT e.title, e.location, e.description, e.timezone, e.created_at, e.updated_at,
                 s.slot_date, s.start_time, s.end_time
          FROM events e JOIN event_slots s ON s.id=e.confirmed_slot_id
          WHERE e.public_token=$1 AND e.status='CONFIRMED'",
@@ -38,13 +40,16 @@ pub async fn download(
         .and_then(|time| to_utc(timezone, date.and_time(time)))
         .filter(|end| *end > start);
     let stamp: DateTime<Utc> = event.get("updated_at");
+    let created: DateTime<Utc> = event.get("created_at");
 
     let mut lines = vec![
         "BEGIN:VCALENDAR".into(),
         "VERSION:2.0".into(),
         "PRODID:-//Frizzi//Event Calendar//EN".into(),
+        "METHOD:PUBLISH".into(),
         "BEGIN:VEVENT".into(),
         format!("UID:{public}@frizzi"),
+        format!("SEQUENCE:{}", sequence(created, stamp)),
         format!("DTSTAMP:{}", timestamp(stamp)),
         format!("DTSTART:{}", timestamp(start)),
     ];
@@ -96,6 +101,12 @@ fn fold_line(line: &str) -> String {
         column += character.len_utf8();
     }
     folded
+}
+
+/// Every change to the event bumps updated_at, so the seconds since creation grow with each
+/// revision and let calendar apps replace an earlier import of the same UID.
+fn sequence(created: DateTime<Utc>, updated: DateTime<Utc>) -> i64 {
+    (updated - created).num_seconds().max(0)
 }
 
 fn timestamp(date: DateTime<Utc>) -> String {
@@ -197,5 +208,15 @@ mod tests {
         assert_folded(&accents, &folded);
         let mixed = format!("SUMMARY:{}", "Cena 🍝 da Ada · ".repeat(10));
         assert_folded(&mixed, &fold_line(&mixed));
+    }
+
+    #[test]
+    fn sequence_grows_with_each_revision() {
+        let created = Utc.with_ymd_and_hms(2030, 1, 1, 12, 0, 0).unwrap();
+        assert_eq!(sequence(created, created), 0);
+        let edited = created + chrono::Duration::seconds(90);
+        assert_eq!(sequence(created, edited), 90);
+        assert!(sequence(created, edited + chrono::Duration::days(3)) > sequence(created, edited));
+        assert_eq!(sequence(edited, created), 0);
     }
 }

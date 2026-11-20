@@ -1,5 +1,5 @@
+use crate::error::{db, ApiError};
 use crate::observability::db_class;
-use crate::{db, ApiError};
 use serde_json::{json, Value};
 use sqlx::{types::Json, PgPool, Postgres, Row, Transaction};
 use std::{
@@ -106,7 +106,10 @@ pub(super) async fn enqueue(
 #[derive(Debug)]
 pub(super) enum AttachmentError {
     Database(sqlx::Error),
+    /// Another dispatcher holds the render lease.
     RenderInProgress,
+    /// Rendering failed transiently; the payload is kept for a later attempt.
+    RenderFailed,
 }
 
 impl From<sqlx::Error> for AttachmentError {
@@ -120,36 +123,81 @@ impl AttachmentError {
         match self {
             Self::Database(error) => db_class(error),
             Self::RenderInProgress => "render_in_progress",
+            Self::RenderFailed => "invitation_pdf_retry",
         }
     }
+
+    /// The mail should simply wait for a later run (as opposed to a database failure).
+    pub(super) fn is_render_pending(&self) -> bool {
+        matches!(self, Self::RenderInProgress | Self::RenderFailed)
+    }
+}
+
+/// Renders that may fail for a transient reason before the mails go out without a PDF.
+const MAX_RENDER_ATTEMPTS: i32 = 3;
+
+/// Timeouts and resource exhaustion can pass; a missing renderer or a document that does not
+/// compile fails the same way every time.
+fn transient(reason: &str) -> bool {
+    matches!(
+        reason,
+        "timeout"
+            | "typst_start_failed"
+            | "typst_input_unavailable"
+            | "typst_input_failed"
+            | "typst_output_failed"
+    )
+}
+
+fn retry_render(reason: &str, failed_renders: i32, may_wait: bool) -> bool {
+    may_wait && transient(reason) && failed_renders < MAX_RENDER_ATTEMPTS
 }
 
 /// How long a dispatcher waits for a render another one claimed (Typst times out after 6s).
 const RENDER_WAIT: Duration = Duration::from_secs(8);
 const RENDER_POLL: Duration = Duration::from_millis(250);
 
+/// `may_wait` is false on a mail's last outbox attempt: it then goes out without the PDF rather
+/// than failing because of it.
 pub(super) async fn attachment(
     pool: &PgPool,
     id: Uuid,
+    may_wait: bool,
 ) -> Result<Option<Vec<u8>>, AttachmentError> {
     let deadline = tokio::time::Instant::now() + RENDER_WAIT;
     loop {
         // Claim the render with a lease instead of a row lock, so no transaction or pooled
         // connection is held while Typst runs; the result is retained for the other recipients.
-        let claimed: Option<Json<Value>> = sqlx::query_scalar(
+        let claimed = sqlx::query(
             "UPDATE confirmation_invitations SET render_locked_until=now()+interval '30 seconds'
              WHERE id=$1 AND payload IS NOT NULL
                AND (render_locked_until IS NULL OR render_locked_until<now())
-             RETURNING payload",
+             RETURNING payload,render_attempts",
         )
         .bind(id)
         .fetch_optional(pool)
         .await?;
-        if let Some(Json(payload)) = claimed {
+        if let Some(row) = claimed {
+            let Json(payload): Json<Value> = row.get("payload");
             let pdf = match render(&payload).await {
                 Ok(attachment) => Some(attachment),
                 Err(reason) => {
-                    tracing::warn!(event = "invitation_pdf_fallback", reason);
+                    let failed_renders = row.get::<i32, _>("render_attempts") + 1;
+                    if retry_render(reason, failed_renders, may_wait) {
+                        tracing::warn!(event = "invitation_pdf_deferred", reason, failed_renders);
+                        // Keep the payload and release the lease so a later run renders again.
+                        sqlx::query(
+                            "UPDATE confirmation_invitations
+                             SET render_attempts=$2,render_locked_until=NULL
+                             WHERE id=$1 AND payload IS NOT NULL",
+                        )
+                        .bind(id)
+                        .bind(failed_renders)
+                        .execute(pool)
+                        .await?;
+                        return Err(AttachmentError::RenderFailed);
+                    }
+                    tracing::warn!(event = "invitation_pdf_fallback", reason, failed_renders);
                     None
                 }
             };
@@ -174,7 +222,11 @@ pub(super) async fn attachment(
             None => return Ok(None),
             Some(row) if !row.get::<bool, _>("pending") => return Ok(row.get("pdf")),
             Some(_) if tokio::time::Instant::now() >= deadline => {
-                return Err(AttachmentError::RenderInProgress)
+                return if may_wait {
+                    Err(AttachmentError::RenderInProgress)
+                } else {
+                    Ok(None)
+                };
             }
             Some(_) => tokio::time::sleep(RENDER_POLL).await,
         }
@@ -206,7 +258,12 @@ async fn render(payload: &Value) -> Result<Vec<u8>, &'static str> {
     command.args(["-", "-"]);
     let source = source(payload);
     let output = tokio::time::timeout(Duration::from_secs(6), async {
-        let mut child = command.spawn().map_err(|_| "typst_start_failed")?;
+        let mut child = command.spawn().map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+                "typst_unavailable"
+            }
+            _ => "typst_start_failed",
+        })?;
         let mut stdin = child.stdin.take().ok_or("typst_input_unavailable")?;
         stdin
             .write_all(source.as_bytes())
@@ -273,5 +330,30 @@ mod tests {
         expected.push_str(include_str!("invitation.typ"));
         assert_eq!(source(&payload), expected);
         assert!(source(&json!({})).starts_with("#let invitation = json(bytes((123,125,)))\n"));
+    }
+
+    #[test]
+    fn only_transient_render_failures_are_retried_and_only_a_few_times() {
+        assert!(retry_render("timeout", 1, true));
+        assert!(retry_render(
+            "typst_start_failed",
+            MAX_RENDER_ATTEMPTS - 1,
+            true
+        ));
+        assert!(!retry_render("timeout", MAX_RENDER_ATTEMPTS, true));
+        assert!(
+            !retry_render("timeout", 1, false),
+            "a mail's last attempt never waits"
+        );
+        for reason in [
+            "typst_unconfigured",
+            "typst_unavailable",
+            "typst_compile_failed",
+            "invalid_pdf",
+        ] {
+            assert!(!retry_render(reason, 1, true), "{reason}");
+        }
+        assert!(AttachmentError::RenderFailed.is_render_pending());
+        assert!(AttachmentError::RenderInProgress.is_render_pending());
     }
 }
