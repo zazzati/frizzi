@@ -189,6 +189,7 @@ pub async fn maintain(pool: &PgPool) -> Result<(), sqlx::Error> {
         tracing::info!(event = "event_retention_purge", events, legacy_mail);
     }
     mail::dispatch(pool, 25).await;
+    mail::cleanup(pool).await;
     Ok(())
 }
 pub async fn maintain_observability(pool: &PgPool) {
@@ -336,9 +337,7 @@ async fn create(
         .bind(&public).bind(&secret).bind(e.title.trim()).bind(&e.description).bind(e.location.trim())
         .bind(e.organizer_name.trim()).bind(&organizer_email).bind(locale(&e.locale))
         .bind(e.allow_multiple_choices).bind(&e.timezone).bind(e.voting_deadline).bind(e.location_geo.map(sqlx::types::Json)).fetch_one(&mut *tx).await.map_err(db)?;
-    for s in &e.slots {
-        insert_slot(&mut tx, id, s).await?;
-    }
+    insert_slots(&mut tx, id, &e.slots).await?;
     mail::enqueue(
         &mut tx,
         id,
@@ -356,18 +355,33 @@ async fn create(
     schedule_mail(pool, runtime);
     Ok(Json(json!({"public_token": public})))
 }
-async fn insert_slot(
+type SlotColumns = (Vec<NaiveDate>, Vec<NaiveTime>, Vec<Option<NaiveTime>>);
+fn slot_columns<'a>(slots: impl IntoIterator<Item = &'a SlotInput>) -> SlotColumns {
+    let mut columns: SlotColumns = Default::default();
+    for s in slots {
+        columns.0.push(s.date);
+        columns.1.push(s.start);
+        columns.2.push(s.end);
+    }
+    columns
+}
+async fn insert_slots<'a>(
     tx: &mut Transaction<'_, Postgres>,
     event_id: Uuid,
-    s: &SlotInput,
+    slots: impl IntoIterator<Item = &'a SlotInput>,
 ) -> Result<(), ApiError> {
+    let (dates, starts, ends) = slot_columns(slots);
+    if dates.is_empty() {
+        return Ok(());
+    }
     sqlx::query(
-        "INSERT INTO event_slots (event_id,slot_date,start_time,end_time) VALUES ($1,$2,$3,$4)",
+        "INSERT INTO event_slots (event_id,slot_date,start_time,end_time)
+         SELECT $1,* FROM UNNEST($2::date[],$3::time[],$4::time[])",
     )
     .bind(event_id)
-    .bind(s.date)
-    .bind(s.start)
-    .bind(s.end)
+    .bind(dates)
+    .bind(starts)
+    .bind(ends)
     .execute(&mut **tx)
     .await
     .map_err(db)?;
@@ -472,10 +486,10 @@ async fn save_vote(pool: &PgPool, public: &str, secret: Option<&str>, v: VoteInp
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-    for slot in &v.slots {
-        sqlx::query("INSERT INTO votes (participant_id,slot_id) VALUES ($1,$2)")
+    if !v.slots.is_empty() {
+        sqlx::query("INSERT INTO votes (participant_id,slot_id) SELECT $1,UNNEST($2::uuid[])")
             .bind(pid)
-            .bind(slot)
+            .bind(&v.slots)
             .execute(&mut *tx)
             .await
             .map_err(db)?;
@@ -972,20 +986,24 @@ async fn update_details(
     }
     if dates_changed {
         // Delete changed slots before inserts so changing/swapping calendar days respects UNIQUE(event_id, slot_date).
-        for s in &old_slots {
-            if !v.slots.contains(s) {
-                sqlx::query("DELETE FROM event_slots WHERE id=$1")
-                    .bind(s.id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(db)?;
-            }
+        let removed: Vec<Uuid> = old_slots
+            .iter()
+            .filter(|s| !v.slots.contains(s))
+            .filter_map(|s| s.id)
+            .collect();
+        if !removed.is_empty() {
+            sqlx::query("DELETE FROM event_slots WHERE id=ANY($1)")
+                .bind(&removed)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
         }
-        for s in &v.slots {
-            if !old_slots.contains(s) {
-                insert_slot(&mut tx, id, s).await?;
-            }
-        }
+        insert_slots(
+            &mut tx,
+            id,
+            v.slots.iter().filter(|s| !old_slots.contains(s)),
+        )
+        .await?;
     }
     sqlx::query("UPDATE events SET title=$1,description=$2,location=$3,organizer_name=$4,allow_multiple_choices=$5,timezone=$6,organizer_locale=$7,voting_deadline=$8,location_geo=$9,updated_at=now() WHERE id=$10")
         .bind(v.title.trim()).bind(&v.description).bind(v.location.trim()).bind(v.organizer_name.trim()).bind(v.allow_multiple_choices)
@@ -1051,6 +1069,29 @@ mod tests {
             "Europe/Rome",
             &slots
         ));
+    }
+    #[test]
+    fn slot_columns_keep_rows_aligned() {
+        let time = |h| NaiveTime::from_hms_opt(h, 0, 0).unwrap();
+        let slots = [
+            SlotInput {
+                id: None,
+                date: NaiveDate::from_ymd_opt(2027, 1, 2).unwrap(),
+                start: time(20),
+                end: Some(time(22)),
+            },
+            SlotInput {
+                id: None,
+                date: NaiveDate::from_ymd_opt(2027, 1, 1).unwrap(),
+                start: time(19),
+                end: None,
+            },
+        ];
+        let (dates, starts, ends) = slot_columns(&slots);
+        assert_eq!(dates, [slots[0].date, slots[1].date]);
+        assert_eq!(starts, [time(20), time(19)]);
+        assert_eq!(ends, [Some(time(22)), None]);
+        assert_eq!(slot_columns(&[]), Default::default());
     }
     #[test]
     fn tokens_and_locales() {

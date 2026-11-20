@@ -1,3 +1,4 @@
+use crate::observability::db_class;
 use crate::{db, ApiError};
 use serde_json::{json, Value};
 use sqlx::{types::Json, PgPool, Postgres, Row, Transaction};
@@ -6,10 +7,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::OnceLock,
+    sync::LazyLock,
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{io::AsyncWriteExt, process::Command, sync::OnceCell};
 use uuid::Uuid;
 
 use super::template::Details;
@@ -17,7 +18,7 @@ use super::template::Details;
 pub(super) const FILENAME: &str = "invito-frizzi.pdf";
 
 const PDF_ASSETS: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/pdf_assets.rs"));
-static PDF_BUNDLE: OnceLock<Option<PathBuf>> = OnceLock::new();
+static PDF_BUNDLE: OnceCell<Option<PathBuf>> = OnceCell::const_new();
 
 #[cfg(unix)]
 fn setup_pdf_bundle() -> std::io::Result<PathBuf> {
@@ -34,13 +35,20 @@ fn setup_pdf_bundle() -> std::io::Result<PathBuf> {
     Ok(root)
 }
 
-fn pdf_bundle() -> Option<&'static Path> {
+async fn pdf_bundle() -> Option<&'static Path> {
     if PDF_ASSETS.is_empty() {
         return None;
     }
     #[cfg(unix)]
     return PDF_BUNDLE
-        .get_or_init(|| setup_pdf_bundle().ok())
+        .get_or_init(|| async {
+            // Writing the bundled binary and fonts is blocking file I/O; keep it off the runtime.
+            tokio::task::spawn_blocking(setup_pdf_bundle)
+                .await
+                .ok()
+                .and_then(Result::ok)
+        })
+        .await
         .as_deref();
     #[cfg(not(unix))]
     None
@@ -95,36 +103,86 @@ pub(super) async fn enqueue(
     .map_err(db)
 }
 
-pub(super) async fn attachment(pool: &PgPool, id: Uuid) -> Result<Option<Vec<u8>>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    // Serialize rendering across recipients and retain the result for retries.
-    let row =
-        sqlx::query("SELECT payload,pdf FROM confirmation_invitations WHERE id=$1 FOR UPDATE")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let mut pdf = None;
-    if let Some(row) = row {
-        if let Some(Json(payload)) = row.get::<Option<Json<Value>>, _>("payload") {
-            match render(&payload).await {
-                Ok(attachment) => pdf = Some(attachment),
-                Err(reason) => tracing::warn!(event = "invitation_pdf_fallback", reason),
-            }
-            sqlx::query("UPDATE confirmation_invitations SET payload=NULL,pdf=$2 WHERE id=$1")
-                .bind(id)
-                .bind(&pdf)
-                .execute(&mut *tx)
-                .await?;
-        } else {
-            pdf = row.get("pdf");
+#[derive(Debug)]
+pub(super) enum AttachmentError {
+    Database(sqlx::Error),
+    RenderInProgress,
+}
+
+impl From<sqlx::Error> for AttachmentError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl AttachmentError {
+    pub(super) fn reason(&self) -> &'static str {
+        match self {
+            Self::Database(error) => db_class(error),
+            Self::RenderInProgress => "render_in_progress",
         }
     }
-    tx.commit().await?;
-    Ok(pdf)
+}
+
+/// How long a dispatcher waits for a render another one claimed (Typst times out after 6s).
+const RENDER_WAIT: Duration = Duration::from_secs(8);
+const RENDER_POLL: Duration = Duration::from_millis(250);
+
+pub(super) async fn attachment(
+    pool: &PgPool,
+    id: Uuid,
+) -> Result<Option<Vec<u8>>, AttachmentError> {
+    let deadline = tokio::time::Instant::now() + RENDER_WAIT;
+    loop {
+        // Claim the render with a lease instead of a row lock, so no transaction or pooled
+        // connection is held while Typst runs; the result is retained for the other recipients.
+        let claimed: Option<Json<Value>> = sqlx::query_scalar(
+            "UPDATE confirmation_invitations SET render_locked_until=now()+interval '30 seconds'
+             WHERE id=$1 AND payload IS NOT NULL
+               AND (render_locked_until IS NULL OR render_locked_until<now())
+             RETURNING payload",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        if let Some(Json(payload)) = claimed {
+            let pdf = match render(&payload).await {
+                Ok(attachment) => Some(attachment),
+                Err(reason) => {
+                    tracing::warn!(event = "invitation_pdf_fallback", reason);
+                    None
+                }
+            };
+            // A renderer whose lease expired must not overwrite a result stored meanwhile.
+            sqlx::query(
+                "UPDATE confirmation_invitations SET payload=NULL,pdf=$2,render_locked_until=NULL
+                 WHERE id=$1 AND payload IS NOT NULL",
+            )
+            .bind(id)
+            .bind(&pdf)
+            .execute(pool)
+            .await?;
+            return Ok(pdf);
+        }
+        let row = sqlx::query(
+            "SELECT payload IS NOT NULL AS pending,pdf FROM confirmation_invitations WHERE id=$1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        match row {
+            None => return Ok(None),
+            Some(row) if !row.get::<bool, _>("pending") => return Ok(row.get("pdf")),
+            Some(_) if tokio::time::Instant::now() >= deadline => {
+                return Err(AttachmentError::RenderInProgress)
+            }
+            Some(_) => tokio::time::sleep(RENDER_POLL).await,
+        }
+    }
 }
 
 async fn render(payload: &Value) -> Result<Vec<u8>, &'static str> {
-    let (executable, fonts) = if let Some(root) = pdf_bundle() {
+    let (executable, fonts) = if let Some(root) = pdf_bundle().await {
         (
             root.join("typst").into_os_string(),
             Some(root.join("fonts").into_os_string()),
@@ -171,17 +229,49 @@ async fn render(payload: &Value) -> Result<Vec<u8>, &'static str> {
     Ok(output.stdout)
 }
 
+fn byte_list(source: &mut String, bytes: &[u8]) {
+    for byte in bytes {
+        let _ = write!(source, "{byte},");
+    }
+}
+
+/// Everything after the payload is constant; encoding the 44KB image as decimal text is done once.
+static SOURCE_TAIL: LazyLock<String> = LazyLock::new(|| {
+    let mut tail = String::from(")))\n#let guests-image = bytes((");
+    byte_list(&mut tail, include_bytes!("invitation-guests.webp"));
+    tail.push_str("))\n");
+    tail.push_str(include_str!("invitation.typ"));
+    tail
+});
+
 fn source(payload: &Value) -> String {
     // Treat the snapshot as bytes so event text cannot become Typst source code.
-    let mut source = String::from("#let invitation = json(bytes((");
-    for byte in payload.to_string().bytes() {
-        let _ = write!(source, "{byte},");
-    }
-    source.push_str(")))\n#let guests-image = bytes((");
-    for byte in include_bytes!("invitation-guests.webp") {
-        let _ = write!(source, "{byte},");
-    }
-    source.push_str("))\n");
-    source.push_str(include_str!("invitation.typ"));
+    let payload = payload.to_string();
+    let mut source = String::with_capacity(32 + payload.len() * 4 + SOURCE_TAIL.len());
+    source.push_str("#let invitation = json(bytes((");
+    byte_list(&mut source, payload.as_bytes());
+    source.push_str(&SOURCE_TAIL);
     source
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_encodes_payload_and_image_as_byte_lists() {
+        let payload = json!({"title": "Cena \"#import\" ✨"});
+        let mut expected = String::from("#let invitation = json(bytes((");
+        for byte in payload.to_string().bytes() {
+            expected.push_str(&format!("{byte},"));
+        }
+        expected.push_str(")))\n#let guests-image = bytes((");
+        for byte in include_bytes!("invitation-guests.webp") {
+            expected.push_str(&format!("{byte},"));
+        }
+        expected.push_str("))\n");
+        expected.push_str(include_str!("invitation.typ"));
+        assert_eq!(source(&payload), expected);
+        assert!(source(&json!({})).starts_with("#let invitation = json(bytes((123,125,)))\n"));
+    }
 }

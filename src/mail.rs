@@ -260,6 +260,40 @@ fn directions_url(location: &str, geo: Option<&LocationGeo>) -> reqwest::Url {
     url
 }
 
+struct Composed {
+    subject: String,
+    body: String,
+    html: String,
+}
+
+fn compose(
+    lang: &str,
+    kind: &str,
+    title: &str,
+    url: &str,
+    details: Option<&Details>,
+    intro: Option<&str>,
+) -> Composed {
+    let subject_key = format!("mail.{kind}Subject");
+    let body_key = format!("mail.{kind}Body");
+    let headline = rust_i18n::t!(&subject_key, locale = lang);
+    let icon = match kind {
+        "confirmed" => "🎉",
+        "cancelled" => "📌",
+        "open" => "🗳️",
+        "changed" => "📣",
+        "vote" => "✅",
+        _ => "🔑",
+    };
+    let default_intro = rust_i18n::t!(&body_key, locale = lang);
+    let intro = intro.unwrap_or(&default_intro);
+    Composed {
+        subject: format!("{icon} {headline} · {}", title.replace(['\r', '\n'], " ")),
+        body: template::plain(lang, kind, &headline, title, intro, url, details, None),
+        html: template::html(lang, kind, &headline, title, intro, url, details, None),
+    }
+}
+
 pub async fn enqueue(
     tx: &mut Transaction<'_, Postgres>,
     event: Uuid,
@@ -272,22 +306,11 @@ pub async fn enqueue(
     intro: Option<&str>,
     invitation: Option<Uuid>,
 ) -> Result<(), ApiError> {
-    let subject_key = format!("mail.{kind}Subject");
-    let body_key = format!("mail.{kind}Body");
-    let headline = rust_i18n::t!(&subject_key, locale = lang);
-    let icon = match kind {
-        "confirmed" => "🎉",
-        "cancelled" => "📌",
-        "open" => "🗳️",
-        "changed" => "📣",
-        "vote" => "✅",
-        _ => "🔑",
-    };
-    let subject = format!("{icon} {headline} · {}", title.replace(['\r', '\n'], " "));
-    let default_intro = rust_i18n::t!(&body_key, locale = lang);
-    let intro = intro.unwrap_or(&default_intro);
-    let body = template::plain(lang, kind, &headline, title, intro, url, details, None);
-    let html = template::html(lang, kind, &headline, title, intro, url, details, None);
+    let Composed {
+        subject,
+        body,
+        html,
+    } = compose(lang, kind, title, url, details, intro);
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO email_outbox (recipient,subject,body,html,event_id,invitation_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
     )
@@ -398,86 +421,101 @@ pub async fn notify(
     };
     let title: String = e.get("title");
     let organizer: String = e.get("organizer_name");
-    let mut invitations = HashMap::new();
-    for (email, lang, url) in recipients {
-        let lang = locale(&lang);
+    // Everything except the recipient's link depends only on the language, so the summary
+    // queries, change notes and invitation snapshot are built once per language.
+    let mut languages: HashMap<&str, (Details, Option<Uuid>)> = HashMap::new();
+    let mut messages = Vec::with_capacity(recipients.len());
+    for (email, lang, url) in &recipients {
+        let lang = locale(lang);
         let intro = confirmation
             .and_then(|extra| extra.intros.get(lang))
             .map(String::as_str);
-        let mut details = summary(tx, event, lang).await?;
-        let invitation_id = if kind == "confirmed" {
-            details.website = website.cloned();
-            details.calendar = Some(format!("{}/api/events/{public}/calendar.ics", base_url()));
-            if let Some(invitation) = invitations.get(lang) {
-                *invitation
+        if !languages.contains_key(lang) {
+            let mut details = summary(tx, event, lang).await?;
+            let invitation_id = if kind == "confirmed" {
+                details.website = website.cloned();
+                details.calendar = Some(format!("{}/api/events/{public}/calendar.ics", base_url()));
+                invitation::enqueue(tx, event, lang, &title, &organizer, intro, &details).await?
             } else {
-                let invitation =
-                    invitation::enqueue(tx, event, lang, &title, &organizer, intro, &details)
-                        .await?;
-                invitations.insert(lang.to_owned(), invitation);
-                invitation
+                None
+            };
+            if let Some((changes, before_slots, dates_changed)) = changes {
+                details.notes = change_notes(changes, before_slots, dates_changed, lang);
             }
-        } else {
-            None
-        };
-        if let Some((changes, before_slots, dates_changed)) = changes {
-            let notes = &mut details.notes;
-            notes.push_str(&format!(
-                "{}\n",
-                rust_i18n::t!("mail.changes", locale = lang)
-            ));
-            for (key, before, after) in changes {
-                let label_key = format!("ui.{key}");
-                let label = rust_i18n::t!(&label_key, locale = lang);
-                let value = |v: &str| -> String {
-                    if key == "multiple" {
-                        rust_i18n::t!(if v == "true" { "ui.yes" } else { "ui.no" }, locale = lang)
-                            .to_string()
-                    } else if key == "votingDeadline" {
-                        chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d")
-                            .map_or_else(|_| "—".to_string(), |date| numeric_date(date, lang))
-                    } else {
-                        v.to_string()
-                    }
-                };
-                notes.push_str(&format!(
-                    "{}\n{}: {}\n{}: {}\n",
-                    label,
-                    rust_i18n::t!("mail.before", locale = lang),
-                    value(before),
-                    rust_i18n::t!("mail.after", locale = lang),
-                    value(after)
-                ));
-            }
-            if dates_changed {
-                notes.push_str(&format!(
-                    "\n{}:\n{}\n",
-                    rust_i18n::t!("mail.before", locale = lang),
-                    format_slots(before_slots, lang)
-                ));
-            }
-            if dates_changed || changes.iter().any(|(key, _, _)| key == "timezone") {
-                notes.push_str(&format!(
-                    "\n{}\n",
-                    rust_i18n::t!("ui.datesChangedHint", locale = lang)
-                ));
-            }
+            languages.insert(lang, (details, invitation_id));
         }
-        enqueue(
-            tx,
-            event,
-            &email,
-            lang,
-            kind,
-            &title,
-            &url,
-            Some(&details),
-            intro,
-            invitation_id,
-        )
-        .await?;
+        let (details, invitation_id) = &languages[lang];
+        let message = compose(lang, kind, &title, url, Some(details), intro);
+        messages.push(serde_json::json!({
+            "recipient": email,
+            "subject": message.subject,
+            "body": message.body,
+            "html": message.html,
+            "invitation_id": invitation_id,
+        }));
+    }
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "INSERT INTO email_outbox (recipient,subject,body,html,event_id,invitation_id)
+         SELECT m.recipient,m.subject,m.body,m.html,$1,m.invitation_id
+         FROM jsonb_to_recordset($2)
+           AS m(recipient text,subject text,body text,html text,invitation_id uuid)
+         RETURNING id",
+    )
+    .bind(event)
+    .bind(Json(messages))
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db)?;
+    for id in ids {
+        tracing::info!(event = "email_prepared", mail_id = %id, kind);
     }
     Ok(())
+}
+
+fn change_notes(
+    changes: &[(String, String, String)],
+    before_slots: &[SlotInput],
+    dates_changed: bool,
+    lang: &str,
+) -> String {
+    let mut notes = format!("{}\n", rust_i18n::t!("mail.changes", locale = lang));
+    for (key, before, after) in changes {
+        let label_key = format!("ui.{key}");
+        let label = rust_i18n::t!(&label_key, locale = lang);
+        let value = |v: &str| -> String {
+            if key == "multiple" {
+                rust_i18n::t!(if v == "true" { "ui.yes" } else { "ui.no" }, locale = lang)
+                    .to_string()
+            } else if key == "votingDeadline" {
+                chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d")
+                    .map_or_else(|_| "—".to_string(), |date| numeric_date(date, lang))
+            } else {
+                v.to_string()
+            }
+        };
+        notes.push_str(&format!(
+            "{}\n{}: {}\n{}: {}\n",
+            label,
+            rust_i18n::t!("mail.before", locale = lang),
+            value(before),
+            rust_i18n::t!("mail.after", locale = lang),
+            value(after)
+        ));
+    }
+    if dates_changed {
+        notes.push_str(&format!(
+            "\n{}:\n{}\n",
+            rust_i18n::t!("mail.before", locale = lang),
+            format_slots(before_slots, lang)
+        ));
+    }
+    if dates_changed || changes.iter().any(|(key, _, _)| key == "timezone") {
+        notes.push_str(&format!(
+            "\n{}\n",
+            rust_i18n::t!("ui.datesChangedHint", locale = lang)
+        ));
+    }
+    notes
 }
 #[derive(Debug)]
 struct DeliveryError {
@@ -605,7 +643,8 @@ pub async fn dispatch(pool: &PgPool, limit: usize) {
         let attempts: i32 = row.get("attempts");
         let start = std::time::Instant::now();
         let html: Option<String> = row.get("html");
-        let pdf = match row.get::<Option<Uuid>, _>("invitation_id") {
+        let invitation: Option<Uuid> = row.get("invitation_id");
+        let pdf = match invitation {
             Some(invitation) => invitation::attachment(pool, invitation).await,
             None => Ok(None),
         };
@@ -622,7 +661,7 @@ pub async fn dispatch(pool: &PgPool, limit: usize) {
                 .await
             }
             Err(error) => {
-                tracing::error!(event = "invitation_load_failed", mail_id = %id, reason = db_class(&error));
+                tracing::error!(event = "invitation_load_failed", mail_id = %id, reason = error.reason());
                 Err("invitation_load_failed".into())
             }
         };
@@ -640,8 +679,19 @@ pub async fn dispatch(pool: &PgPool, limit: usize) {
                 Err(error) => tracing::error!(event = "mail_receipt_write_failed", mail_id = %id, reason = db_class(&error)),
                 Ok(_) => tracing::info!(event = "mail_accepted", mail_id = %id, attempts, duration_ms),
             }
+            if let Some(invitation) = invitation {
+                // Drop the rendered PDF as soon as its last recipient has it; cleanup() catches races.
+                if let Err(error) = sqlx::query("DELETE FROM confirmation_invitations WHERE id=$1 AND NOT EXISTS (SELECT 1 FROM email_outbox WHERE invitation_id=$1)")
+                    .bind(invitation).execute(pool).await {
+                    tracing::error!(event = "maintenance_cleanup_failed", operation = "invitation", reason = db_class(&error));
+                }
+            }
         }
     }
+}
+
+/// Periodic housekeeping, run by the maintenance worker and the cron rather than after every write.
+pub async fn cleanup(pool: &PgPool) {
     for (operation, query) in [
         ("invitation", "DELETE FROM confirmation_invitations WHERE NOT EXISTS (SELECT 1 FROM email_outbox WHERE invitation_id=confirmation_invitations.id)"),
         ("sent_mail", "DELETE FROM email_outbox WHERE sent_at<now()-interval '7 days'"),
@@ -698,6 +748,52 @@ mod tests {
         assert!(
             parse_intros(&json!({"candidates":[{"finishReason":"SAFETY"}]}), &["it"]).is_none()
         );
+    }
+
+    #[test]
+    fn change_notes_localize_values_and_flag_schedule_changes() {
+        let changes = [
+            ("multiple".into(), "true".into(), "false".into()),
+            ("votingDeadline".into(), "2027-01-31".into(), String::new()),
+        ];
+        assert_eq!(
+            change_notes(&changes, &[], false, "en"),
+            "What changed\nAllow multiple dates per person\nBefore: Yes\nAfter: No\n\
+             Voting deadline\nBefore: 31/01/2027\nAfter: —\n"
+        );
+        let hint = rust_i18n::t!("ui.datesChangedHint", locale = "en");
+        let slots = [SlotInput {
+            id: None,
+            date: NaiveDate::from_ymd_opt(2027, 1, 1).unwrap(),
+            start: chrono::NaiveTime::from_hms_opt(20, 0, 0).unwrap(),
+            end: None,
+        }];
+        assert_eq!(
+            change_notes(&[], &slots, true, "en"),
+            format!(
+                "What changed\n\nBefore:\n{}\n\n{hint}\n",
+                format_slots(&slots, "en")
+            )
+        );
+        let timezone = [("timezone".into(), "Europe/Rome".into(), "UTC".into())];
+        assert!(change_notes(&timezone, &[], false, "en").ends_with(&format!("\n{hint}\n")));
+        assert!(!change_notes(&changes, &[], false, "en").contains(hint.as_ref()));
+    }
+
+    #[test]
+    fn composed_subject_has_icon_and_single_line_title() {
+        let message = compose(
+            "en",
+            "changed",
+            "Dinner\r\nparty",
+            "https://x.test/a",
+            None,
+            None,
+        );
+        let headline = rust_i18n::t!("mail.changedSubject", locale = "en");
+        assert_eq!(message.subject, format!("📣 {headline} · Dinner  party"));
+        assert!(message.body.contains("https://x.test/a"));
+        assert!(message.html.contains("https://x.test/a"));
     }
 
     #[test]
