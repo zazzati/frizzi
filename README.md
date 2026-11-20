@@ -94,6 +94,7 @@ To enable PDF invitations, set `FRIZZI_TYPST` and `FRIZZI_PDF_FONTS`. The [Typst
 ```sh
 npm run test:setup
 npm run check
+npm run test:unit
 npm run build
 cargo test --lib
 npm test
@@ -101,6 +102,8 @@ npm audit
 ```
 
 If Chromium’s dependencies are missing on Linux, install them with `npx playwright install-deps chromium`. The suite also uses any browser libraries already installed in `~/.cache/frizzi/browser-libs`.
+
+`npm run test:unit` runs the Vitest unit tests for the pure frontend logic in `src/lib` (date entry, poll results, error messages) and checks that every locale has the same keys. It needs no services. `npm run coverage` runs the same tests and writes a coverage report to `coverage/`.
 
 `npm test` starts a temporary PostgreSQL 16 database, Mailpit, the Rust API and Vite on dedicated ports. Integration tests cover event creation, privacy, authorisation, isolation between events, voting, edits, localised notifications and SMTP retries. Browser checks cover all eleven languages, right-to-left layout, language persistence, the event workflow and mobile rendering. Screenshots go to `test-results/`. Test emails stay in the local Mailpit inbox.
 

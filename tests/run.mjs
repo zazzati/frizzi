@@ -81,6 +81,7 @@ try{
   assert.deepEqual(Object.keys(dictionary.mail).sort(),Object.keys(italian.mail).sort());
   check(Object.values(dictionary.ui).every(value=>typeof value==='string'&&value.length),'Missing UI translation');
  }
+ check((await fetch(web+'/not-an-event')).status===404&&(await fetch(web+'/favicon.svg')).headers.get('content-type').includes('svg'),'Malformed links are real 404s and the favicon is served');
  await call('/api/events','POST',{...initial,slots:[initial.slots[0],initial.slots[0]]},400);
  await call('/api/events','POST',{...initial,timezone:'invalid/timezone'},400);
  check((await call('/api/places/suggest','POST',{text:'Via Roma Torino'})).enabled===false,'Location lookup is optional');
@@ -312,7 +313,16 @@ try{
  await emailPreview.setContent(confirmation.HTML);
  check(await emailPreview.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'Confirmation email fits a narrow screen');
  await emailPreview.close();
- const page=await browser.newPage();
+ const page=await browser.newPage({locale:'it-IT',timezoneId:'Europe/Rome'});
+ for(const [locale,code] of [['de-AT','de'],['ar-EG','ar']]){
+  const visitor=await browser.newPage({locale});
+  await visitor.addInitScript(()=>new MutationObserver((_,observer)=>{if(document.body){window.firstPaint=[document.documentElement.lang,document.documentElement.dir];observer.disconnect();}}).observe(document,{childList:true,subtree:true}));
+  await visitor.goto(web);await visitor.waitForSelector('header[data-ready="true"]');
+  const dictionary=JSON.parse(await readFile(`locales/${code}.json`,'utf8'));
+  await visitor.getByRole('heading',{name:dictionary.ui.create,exact:true}).waitFor();
+  check((await visitor.evaluate(()=>window.firstPaint.join()))===`${code},${code==='ar'?'rtl':'ltr'}`&&await visitor.evaluate(()=>localStorage.getItem('locale'))===null,`First visit follows the ${locale} browser before the first paint without saving it`);
+  await visitor.close();
+ }
  await page.goto(web);
  await page.locator('footer').getByRole('link',{name:'Informativa sulla privacy'}).click();
  await page.getByRole('heading',{name:'Informativa sulla privacy'}).waitFor();
@@ -321,13 +331,18 @@ try{
    Object.defineProperty(navigator,'share',{value:async data=>localStorage.setItem('sharedEvent',JSON.stringify(data))});
  });
  const browserErrors=[];page.on('pageerror',error=>browserErrors.push(error.message));
- const unavailable=await browser.newPage();
+ const unavailable=await browser.newPage({locale:'it-IT'});
  await unavailable.route('**/api/events/*',route=>route.fulfill({status:502,contentType:'text/html',body:'<h1>Bad gateway</h1>'}));
  await unavailable.goto(web+retentionPath.replace('/api/events',''));
  await unavailable.getByText('Il servizio è temporaneamente indisponibile. Riprova tra poco.').waitFor();
+ await unavailable.unroute('**/api/events/*');await unavailable.getByRole('button',{name:'Riprova',exact:true}).click();
+ await unavailable.getByRole('link',{name:'Crea un evento',exact:true}).waitFor();
+ check(await unavailable.getByRole('heading',{name:'Pagina non trovata'}).isVisible(),'Retry reloads in place and a missing event offers to create one');
  await unavailable.close();
  await page.goto(web);await page.waitForSelector('header[data-ready="true"]');await page.waitForSelector('input[name="title"]');
  const select=page.locator('header select');
+ // Dictionaries other than Italian load on demand: wait until the page has switched.
+ const chooseLanguage=async code=>{await select.selectOption(code);await page.waitForFunction(code=>document.documentElement.lang===code,code);};
  for(const locale of locales){
    const dictionary=JSON.parse(await readFile(`locales/${locale}.json`,'utf8'));
    await select.selectOption(locale);
@@ -336,7 +351,7 @@ try{
  }
  await select.selectOption('ar');await page.reload();await page.waitForFunction(()=>document.documentElement.dir==='rtl');
  check(await select.inputValue()==='ar','Language persists after reload');
- await select.selectOption('it');
+ await chooseLanguage('it');
  const venue={label:'Caffè Florian, Piazza San Marco 57, Venezia',geo:{
   latitude:45.4336,longitude:12.33828,kind:'venue',attribution:'© OpenStreetMap contributors'
  }};
@@ -357,17 +372,20 @@ try{
  await locationInput.press('Enter');
  check(await locationInput.inputValue()===venue.label,'Keyboard selects and retains the correct venue');
  const dateInput=page.locator('[name="date-0"]');
- check(await dateInput.getAttribute('placeholder')==='DD/MM/YYYY','Italian date field uses day/month/year with the default browser locale');
+ check(await dateInput.getAttribute('placeholder')==='GG/MM/AAAA','Italian date field spells day/month/year in Italian');
  await dateInput.fill('31/02/2030');
  check(await dateInput.evaluate(input=>!input.checkValidity()),'Localized date rejects an impossible day');
+ await dateInput.blur();await page.getByText('Inserisci una data valida nel formato indicato.').waitFor();
+ check(await dateInput.getAttribute('aria-invalid')==='true'&&(await dateInput.getAttribute('aria-describedby'))==='date-0-error','An impossible date is flagged with aria-invalid and a visible message');
  await dateInput.fill('31032030');
  await dateInput.blur();
  check(await dateInput.inputValue()==='31/03/2030','Compact keyboard entry is normalized to the selected date format');
- await select.selectOption('de');
+ await chooseLanguage('de');
  check(await dateInput.inputValue()==='31.03.2030','Date field follows German formatting');
- await select.selectOption('zh');
+ await chooseLanguage('zh');
  check(await dateInput.inputValue()==='2030/03/31','Date field follows Chinese date order');
- await select.selectOption('it');
+ await chooseLanguage('it');
+ check((await page.locator('[name="start-0-minute"] option').allTextContents()).join(',')==='—,00,05,10,15,20,25,30,35,40,45,50,55','Minutes are offered in five-minute steps');
  await page.locator('[name="start-0-hour"]').selectOption('19');
  await page.locator('[name="start-0-minute"]').selectOption('30');
  await page.locator('[name="end-0-hour"]').selectOption('22');
@@ -379,16 +397,34 @@ try{
  await page.locator('[name="voting_deadline"]').fill('25/02/2030');
  await page.getByRole('button',{name:'Aggiungi una data'}).click();
  check(await page.locator('[name="date-1"]').inputValue()==='01/04/2030','New date defaults to the next calendar day across a month boundary');
+ check(await page.locator('[name="date-1"]').evaluate(input=>input===document.activeElement),'Adding a date focuses its date field');
  check(await page.locator('[name="start-1-hour"]').inputValue()==='19' && await page.locator('[name="start-1-minute"]').inputValue()==='30','New date copies the start time');
  check(await page.locator('[name="end-1-hour"]').inputValue()==='22' && await page.locator('[name="end-1-minute"]').inputValue()==='45','New date copies the end time');
  await page.locator('[name="end-1-hour"]').selectOption('');
  check(await page.locator('[name="end-0-hour"]').inputValue()==='22','Changing the new row leaves the previous one intact');
  await page.locator('[name="organizer_name"]').fill('Browser Ada');await page.locator('[name="organizer_email"]').fill('browser@example.test');
+ await page.locator('[name="end-0-hour"]').selectOption('18');await page.locator('[name="date-1"]').fill('31/03/2030');
+ await page.getByRole('button',{name:'Crea evento',exact:true}).click();
+ await page.getByRole('alert').filter({hasText:'Controlla i campi'}).waitFor();
+ const endHour=page.locator('[name="end-0-hour"]'),secondDate=page.locator('[name="date-1"]');
+ const describedText=async field=>page.locator('#'+await field.getAttribute('aria-describedby')).textContent();
+ check(await endHour.getAttribute('aria-invalid')==='true'&&await describedText(endHour)==='L’orario di fine deve essere dopo l’inizio.'&&await endHour.evaluate(field=>field===document.activeElement),'An end time before the start is flagged on its own row and focused');
+ check(await secondDate.getAttribute('aria-invalid')==='true'&&(await describedText(secondDate)).startsWith('Questa data è già nell’elenco')&&await page.locator('[name="date-0"]').getAttribute('aria-invalid')==='false','A repeated date is flagged on the later row only');
+ await endHour.selectOption('22');await secondDate.fill('01/04/2030');
+ check(await page.locator('.slot-error').count()===0&&await endHour.getAttribute('aria-invalid')===null,'Row errors clear as the rows are fixed');
  await page.getByRole('button',{name:'Crea evento',exact:true}).click();
  await page.getByRole('heading',{name:'Evento creato!',exact:true}).waitFor();
+ check(await page.getByRole('heading',{name:'Evento creato!',exact:true}).evaluate(heading=>heading===document.activeElement),'The success heading takes focus after creating');
  const publicUrl=await page.locator('input[readonly]').inputValue();const browserToken=publicUrl.split('/').at(-1);
  await page.getByRole('button',{name:'Condividi',exact:true}).click();
  check(JSON.parse(await page.evaluate(()=>localStorage.getItem('sharedEvent'))).url===publicUrl,'Share opens the public event only');
+ await page.getByRole('link',{name:'Crea un altro evento',exact:true}).click();
+ await page.getByRole('heading',{name:'Crea il tuo evento',exact:true}).waitFor();
+ check((await Promise.all(['title','location','organizer_name','organizer_email','date-0'].map(name=>page.locator(`[name="${name}"]`).inputValue()))).join('')===''&&await page.locator('[name="date-1"]').count()===0,'Create another starts from an empty form');
+ await page.locator('[name="date-0"]').fill('31/02');await page.getByRole('button',{name:'Aggiungi una data'}).click();
+ await page.getByRole('button',{name:/^Rimuovi/}).first().click();
+ check(await page.locator('[name="date-0"]').inputValue()===''&&await page.locator('[name="date-1"]').count()===0,'Removing a date row leaves no stale draft in the next one');
+ check(await page.getByRole('button',{name:'Aggiungi una data'}).evaluate(button=>button===document.activeElement),'Removing the second-last row moves focus to Add a date');
  const browserAdmin=tokenFrom((await messageFor('browser@example.test')).Text);
  const debugResponse=await fetch(`${api}/api/events/${browserToken}/admin/${browserAdmin}/tiebreak`,{
   method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({slot_id:randomUUID()})
@@ -428,12 +464,16 @@ try{
  await page.locator('[name="participant_name"]').fill('Browser Guest');await page.locator('[name="participant_email"]').fill('browser-guest@example.test');
  const deadlineBanner=page.locator('.vote-deadline');
  check(await deadlineBanner.locator('time').getAttribute('datetime')==='2030-02-25','Voting deadline is prominently displayed with the correct date');
- check((await deadlineBanner.locator('time').textContent()).includes('25/02/2030'),'Public deadline uses the active language’s date format');
- await select.selectOption('de');
- check((await deadlineBanner.locator('time').textContent()).includes('25.02.2030'),'Public deadline updates when the language changes');
- await select.selectOption('it');
+ check((await deadlineBanner.locator('time').textContent())==='lun 25 feb 2030','Public deadline spells out the month in the active language');
+ await chooseLanguage('de');
+ check((await deadlineBanner.locator('time').textContent())==='Mo., 25. Feb. 2030','Public deadline updates when the language changes');
+ await chooseLanguage('it');
  const leaders=page.locator('.result-leaders');
  check(await leaders.count()===0,'No leading date before a vote');
+ const traveller=await browser.newPage({locale:'it-IT',timezoneId:'America/New_York'});
+ await traveller.goto(publicUrl);await traveller.locator('label.date-option').first().waitFor();
+ check((await traveller.locator('label.date-option').first().textContent()).includes('Nel tuo fuso orario: 13:30')&&await traveller.locator('.event-fact[title="Europe/Rome"]').textContent().then(text=>text.includes('Ora dell’Europa centrale')),'Guests elsewhere see their own time and a readable event zone');
+ await traveller.close();
  const marchDay=page.locator('button[data-calendar-date="2030-03-31"]');
  const aprilDay=page.locator('button[data-calendar-date="2030-04-01"]');
  const checkboxes=page.locator('[name="dates"]');
@@ -445,11 +485,18 @@ try{
  await checkboxes.last().check();
  await aprilDay.waitFor();
  check(await aprilDay.getAttribute('aria-pressed')==='true','Checkbox selects and reveals a date in another month');
- await page.getByRole('button',{name:'Mese precedente',exact:true}).click();
+ check(await page.locator('.event-calendar').getAttribute('aria-hidden')==='true'&&await aprilDay.getAttribute('tabindex')==='-1','The calendar mirrors the date list for pointer users only');
+ await page.locator('.calendar-month button[aria-label="Mese precedente"]').click();
  check(await marchDay.getAttribute('aria-pressed')==='true','Selections survive month navigation');
  await checkboxes.last().uncheck();
+ await page.evaluate(()=>{document.querySelector('.event-header').dataset.mounted='yes';document.addEventListener('click',()=>window.clickScroll=scrollY,{once:true,capture:true});});
  await page.getByRole('button',{name:'Invia disponibilità',exact:true}).click();
- await page.getByRole('status').filter({hasText:'Risposta salvata'}).waitFor();
+ const voteNotice=page.locator('form .vote-feedback .notice').filter({hasText:'Risposta salvata'});
+ await voteNotice.waitFor();
+ check(await page.locator('.feedback-area').count()===0&&await voteNotice.evaluate(notice=>notice.parentElement.nextElementSibling?.matches('button[type="submit"]')),'The vote notice sits right above the submit button, not at the top of the page');
+ check(await page.evaluate(()=>document.querySelector('.event-header')?.dataset.mounted==='yes'&&window.clickScroll>0&&scrollY>0),'Saving a vote refreshes the results without remounting the page or jumping to the top');
+ check(await page.evaluate(()=>document.activeElement?.classList.contains('notice'))&&await page.getByRole('list',{name:'Tutti i partecipanti'}).getByRole('listitem').count()===1,'The saved notice takes focus and participants are a named list');
+ check((await page.locator('.result>span').allTextContents()).join('|')==='1 disponibile|0 disponibili','Vote counts use Italian singular and plural forms');
  await until(async()=>{
   const stats=await client.query("SELECT count(*) FROM usage_metrics WHERE (action, outcome) IN (('create_event','ok'),('event_location','suggested'),('vote_selection','both'),('share','native'),('browser_error','invalid_response'))");
   return stats.rows[0].count==='5';
@@ -457,6 +504,11 @@ try{
  check(true,'Usage statistics capture real browser actions and proxy errors');
  await leaders.getByRole('heading',{name:'Data in testa'}).waitFor();
  check((await leaders.locator('time').evaluateAll(nodes=>nodes.map(node=>node.dateTime))).join(',')==='2030-03-31','The first positive vote identifies the sole leading date');
+ await page.locator('[name="participant_name"]').fill('Browser Guest');await page.locator('[name="participant_email"]').fill('browser-guest@example.test');
+ await page.getByRole('button',{name:'Invia disponibilità',exact:true}).click();
+ const voteError=page.locator('form .vote-feedback .error');await voteError.waitFor();
+ check(await page.locator('[name="participant_email"]').getAttribute('aria-describedby')===await voteError.getAttribute('id')&&(await voteError.textContent()).startsWith('Questa email ha già risposto'),'A vote error is shown by the button and linked to the email field');
+ await page.reload();await page.locator('[name="participant_name"]').waitFor();
  await page.getByText('Hai perso il link privato?',{exact:true}).click();
  await page.locator('[name="recovery_email"]').fill('browser-guest@example.test');
  await page.getByRole('button',{name:'Reinvia il link',exact:true}).click();
@@ -474,19 +526,28 @@ try{
  const singleDates=(await call('/api/events/'+single.public_token)).slots;
  await page.locator(`button[data-calendar-date="${singleDates[0].date}"]`).click();
  await checkboxes.last().check();
- check(!(await checkboxes.first().isChecked()) && await page.locator(`button[data-calendar-date="${singleDates[1].date}"]`).getAttribute('aria-pressed')==='true','Single-choice mode replaces the previous selection');
+ check(!(await checkboxes.first().isChecked()) && await page.locator(`button[data-calendar-date="${singleDates[1].date}"]`).getAttribute('aria-pressed')==='true'&&await checkboxes.first().getAttribute('type')==='radio','Single-choice mode is a radio group that replaces the previous selection');
  await page.goto(`${publicUrl}/admin/${browserAdmin}`);
  await page.getByText(/Più disponibilità/).first().waitFor();
+ await page.context().grantPermissions(['clipboard-read','clipboard-write'],{origin:web});
+ const adminLinkBox=page.getByRole('region',{name:'Il tuo link di gestione'});
+ await adminLinkBox.getByRole('button',{name:'Copia link'}).click();
+ check(await adminLinkBox.getByRole('textbox').inputValue()===`${publicUrl}/admin/${browserAdmin}`&&await page.evaluate(()=>navigator.clipboard.readText())===`${publicUrl}/admin/${browserAdmin}`&&(await adminLinkBox.textContent()).includes('Tienilo privato'),'The organizer can see and copy their private management link');
  await page.getByText('Scrivi ai partecipanti',{exact:true}).click();
  const messageBox=page.getByRole('textbox',{name:'Messaggio',exact:true});
  await messageBox.fill('Ci vediamo domani!');
  await messageBox.selectText();
  await page.getByRole('button',{name:'Grassetto',exact:true}).click();
  check(await messageBox.inputValue()==='<b>Ci vediamo domani!</b>','Organizer can format selected text');
+ check(await page.getByRole('region',{name:'Anteprima'}).locator('b').textContent()==='Ci vediamo domani!','The message preview renders the allowed formatting');
  await page.getByRole('button',{name:'Invia messaggio',exact:true}).click();
- await page.getByRole('status').filter({hasText:'Email in coda'}).waitFor();
+ const messageDialog=page.getByRole('dialog',{name:'Inviare il messaggio?'});
+ await messageDialog.waitFor();
+ check((await messageDialog.textContent()).includes('1 persona riceverà questo messaggio via email.'),'Sending a message asks for confirmation with the recipient count');
+ await messageDialog.getByRole('button',{name:'Invia messaggio',exact:true}).click();
+ await page.getByRole('status').filter({hasText:'1 email in coda'}).waitFor();
  check((await messageFor('browser-guest@example.test','💌 Una novità per te!')).HTML.includes('<b>Ci vediamo domani!</b>'),'Admin composer delivers the formatted message');
- await page.getByRole('button',{name:'Mese successivo',exact:true}).click();
+ await page.locator('.calendar-month button[aria-label="Mese successivo"]').click();
  await aprilDay.click();
  check(await page.evaluate(()=>document.activeElement?.id.startsWith('confirm-')) && (await call('/api/events/'+browserToken)).status==='OPEN','Admin selection focuses the confirmation without changing event status');
  check(await page.getByText(/Più disponibilità/).count()===2,'Admin highlights tied dates');
@@ -494,10 +555,10 @@ try{
  check(await page.locator('[name="voting_deadline"]').inputValue()==='25/02/2030','Admin can see configured deadline in the active date format');
  check(await page.locator('[name="start-0-hour"]').inputValue()==='19' && await page.locator('[name="start-0-minute"]').inputValue()==='30','Stored time loads in the editor');
  await page.locator('[name="location"]').fill('Bologna');await page.getByRole('button',{name:'Salva modifiche',exact:true}).click();
- await page.getByRole('status').filter({hasText:'Modifiche salvate'}).waitFor();
+ await page.locator('.feedback-area .notice').filter({hasText:'Modifiche salvate'}).waitFor();
  const editedVenue=await call(`/api/events/${browserToken}`);
  check(editedVenue.location==='Bologna' && editedVenue.location_geo===null,'Manual editing clears stale coordinates');
- await leaders.getByRole('button',{name:/Voto di spareggio.*31\/03\/2030/}).click();
+ await leaders.getByRole('button',{name:/Voto di spareggio · dom 31 mar 2030/}).click();
  await leaders.getByRole('heading',{name:'Data scelta allo spareggio'}).waitFor();
  check(await leaders.locator('time').count()===1&&await leaders.locator('time').getAttribute('datetime')==='2030-03-31','Deciding vote leaves one winner');
  check(await leaders.evaluate(el=>getComputedStyle(el).backgroundColor)==='rgb(242, 234, 253)','Leaderboard uses a light violet background');
@@ -505,11 +566,26 @@ try{
   const fonts=await document.fonts.load('600 14px Inter');
   return fonts.some(font=>font.family==='Inter')&&getComputedStyle(document.querySelector('h1')).fontFamily.startsWith('Inter');
  }),'The site loads the local Inter font');
+ check(await page.evaluate(()=>{
+  const preload=document.querySelector('link[rel="preload"][as="font"]');
+  return !!preload&&[...document.fonts].some(font=>font.family==='Inter'&&font.status==='loaded'&&font.unicodeRange.includes('U+400-52F'))&&new URL(preload.href).pathname.endsWith('.woff2');
+ }),'The Latin and Cyrillic Inter subset is preloaded and declares its unicode-range');
+ const offGrid=await call('/api/events','POST',{...initial,organizer_email:'offgrid@example.test',slots:[{date:'2030-02-03',start:'19:07',end:null}]});
+ await page.goto(`${web}/${offGrid.public_token}/admin/${tokenFrom((await messageFor('offgrid@example.test')).Text)}`);
+ await page.locator('.responses>p').filter({hasText:'Ancora nessuna risposta. Condividi il link per raccogliere le disponibilità.'}).waitFor();
+ await page.getByRole('button',{name:'Modifica i dettagli',exact:true}).click();
+ check(await page.locator('[name="start-0-minute"]').inputValue()==='07'&&await page.locator('[name="start-0-minute"] option').count()===14,'Editing keeps a saved minute that is off the five-minute grid');
  await page.goto(publicUrl);
  await page.getByText('Voto decisivo dell’organizzatore',{exact:true}).waitFor();
  check(await page.getByRole('button',{name:/spareggio/i}).count()===0,'Participants see the deciding vote without organizer controls');
  await page.goto(`${publicUrl}/admin/${browserAdmin}`);
- await page.getByRole('button',{name:'Conferma questa data',exact:true}).first().click();await page.locator('.event-confirmed').waitFor();
+ await page.getByRole('button',{name:/^Conferma questa data · /}).first().waitFor();
+ check(new Set(await page.getByRole('button',{name:/^Conferma questa data · /}).evaluateAll(buttons=>buttons.map(button=>button.getAttribute('aria-label')))).size===2,'Each confirm button names its date');
+ const confirmDate=page.getByRole('button',{name:/^Conferma questa data · /}).first();
+ const confirmDialog=page.getByRole('dialog',{name:'Confermare questa data?'});
+ await confirmDate.click();await confirmDialog.waitFor();await page.keyboard.press('Escape');await confirmDialog.waitFor({state:'hidden'});
+ check((await call('/api/events/'+browserToken)).status==='OPEN'&&await confirmDate.evaluate(button=>button===document.activeElement),'Confirming a date needs the dialog; Escape keeps the poll open and returns focus');
+ await confirmDate.click();await confirmDialog.getByRole('button',{name:'Conferma e avvisa tutti',exact:true}).click();await page.locator('.event-confirmed').waitFor();
  check(await status.getAttribute('data-state')==='confirmed'&&(await status.textContent()).trim()==='Evento confermato','Confirmation has its own status badge');
  check(await page.getByText('Voto decisivo dell’organizzatore',{exact:true}).isVisible(),'Confirmed winner keeps its deciding-vote badge');
  const calendarLink=page.getByRole('link',{name:'Aggiungi al calendario',exact:true});

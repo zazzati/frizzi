@@ -1,16 +1,17 @@
 <script lang="ts">
  import { CalendarDays } from '@lucide/svelte';
  import { dateFormatter, lang, t } from '#lib/i18n.ts';
+ import { dateOrder, datePlaceholder, readDate } from '#lib/dates.ts';
 
  export let name: string;
  export let label: string;
  export let value = '';
  export let required = false;
  export let describedBy: string | undefined = undefined;
+ /** Set by the form when the date is valid on its own but wrong in context, e.g. used twice. */
+ export let conflict = false;
 
  const example = new Date('2031-04-27T12:00:00Z');
- const fieldSizes = { day: 2, month: 2, year: 4 };
- type DatePart = keyof typeof fieldSizes;
  let input: HTMLInputElement;
  let picker: HTMLInputElement;
  let draft = '';
@@ -19,55 +20,38 @@
 
  $: formatter = dateFormatter($lang);
  $: dateParts = formatter.formatToParts(example);
- $: order = dateParts.filter((part): part is Intl.DateTimeFormatPart & {type: DatePart} =>
-   part.type === 'day' || part.type === 'month' || part.type === 'year').map(part => part.type);
- $: placeholder = dateParts.map(part => {
-   if (part.type === 'day') return 'DD';
-   if (part.type === 'month') return 'MM';
-   if (part.type === 'year') return 'YYYY';
-   return part.value;
- }).join('');
+ $: order = dateOrder(dateParts);
+ $: placeholder = datePlaceholder(dateParts, $t.dateLetters);
  $: if (value !== syncedValue || formatter !== syncedFormatter) {
    draft = value ? formatter.format(new Date(`${value}T12:00:00Z`)) : '';
    syncedValue = value;
    syncedFormatter = formatter;
  }
- $: input?.setCustomValidity(draft.trim() && !value ? $t.invalidDate : '');
-
- function readDate(raw: string) {
-   const normalized = raw.trim().replace(/[\u200e\u200f\u061c]/g, '').replace(/[٠-٩۰-۹০-৯०-९]/g, digit => {
-     const start = ['٠','۰','০','०'].find(zero => digit >= zero && digit <= String.fromCharCode(zero.charCodeAt(0) + 9))!;
-     return String(digit.charCodeAt(0) - start.charCodeAt(0));
-   });
-   let iso = normalized;
-   if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) {
-     let offset = 0;
-     const parts = /^\d{8}$/.test(normalized)
-       ? order.map(part => {
-           const partValue = normalized.slice(offset, offset + fieldSizes[part]);
-           offset += fieldSizes[part];
-           return partValue;
-         })
-       : normalized.split(/[\/\.\s-]/);
-     if (parts.length !== 3 || parts.some((part, i) =>
-       !/^\d+$/.test(part) || (order[i] === 'year' ? part.length !== 4 : part.length > 2))) return '';
-     const [year, month, day] = (['year','month','day'] as const).map(part =>
-       parts[order.indexOf(part)].padStart(fieldSizes[part], '0'));
-     iso = `${year}-${month}-${day}`;
-   }
-   if (iso.startsWith('0000-')) return '';
-   const date = new Date(`${iso}T12:00:00Z`);
-   return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === iso ? iso : '';
+ $: invalid = !!draft.trim() && !value;
+ $: input?.setCustomValidity(invalid ? $t.invalidDate : '');
+ // The error shows once the person leaves the field or submits, not while typing.
+ let touched = false;
+ let pressed = false;
+ $: showError = invalid && touched;
+ // The message pushes the content below it down. Revealing it while the pointer that caused the
+ // blur is still pressed would move the target (e.g. Add a date) away and lose the click, so it
+ // waits for the release and for the click that follows it.
+ function reveal() {
+   if (!pressed) return void setTimeout(() => touched = true);
+   const later = () => setTimeout(() => touched = true);
+   addEventListener('pointerup', later, { once: true });
+   addEventListener('pointercancel', later, { once: true });
  }
+ $: describedByIds = [describedBy, showError ? `${name}-error` : ''].filter(Boolean).join(' ') || undefined;
 
  function setDraft(raw: string) {
    draft = raw;
-   syncedValue = readDate(raw);
+   syncedValue = readDate(raw, order);
    value = syncedValue;
  }
 
  function usePicker(iso: string) {
-   syncedValue = readDate(iso);
+   syncedValue = readDate(iso, order);
    value = syncedValue;
    draft = value ? formatter.format(new Date(`${value}T12:00:00Z`)) : '';
  }
@@ -80,18 +64,22 @@
  }
 </script>
 
+<svelte:window on:pointerdown|capture={() => pressed = true} on:pointerup|capture={() => pressed = false} on:pointercancel|capture={() => pressed = false}/>
+
 <label for={name}>{label}{required ? ' *' : ''}</label>
 <div class="date-entry">
  <input id={name} {name} type="text" inputmode="numeric" autocomplete="off"
-  {required} {placeholder} aria-describedby={describedBy} bind:this={input} value={draft}
+  {required} {placeholder} aria-describedby={describedByIds} aria-invalid={showError || conflict} bind:this={input} value={draft}
   on:input={(event) => setDraft(event.currentTarget.value)}
-  on:blur={() => { if (value) usePicker(value); }}/>
- <button type="button" class="date-picker-button" aria-label={`${label}: ${$t.eventCalendar}`} on:click={showCalendar}>
+  on:invalid={() => touched = true}
+  on:blur={() => { reveal(); if (value) usePicker(value); }}/>
+ <button type="button" class="date-picker-button" aria-label={`${$t.openDatePicker}: ${label}`} on:click={showCalendar}>
   <CalendarDays size={17} aria-hidden="true"/>
  </button>
  <input class="native-date" type="date" tabindex="-1" aria-hidden="true" min="0001-01-01" max="9999-12-31"
   value={value} bind:this={picker} on:change={(event) => usePicker(event.currentTarget.value)}/>
 </div>
+{#if showError}<p class="field-error" id={`${name}-error`}>{$t.invalidDate}</p>{/if}
 
 <style>
  .date-entry { position: relative; }

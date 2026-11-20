@@ -17,7 +17,9 @@
   },
   "include": [
     "src",
-    "vite.config.ts"
+    "tests/unit",
+    "vite.config.ts",
+    "vitest.config.ts"
   ],
   "exclude": [
     "src/service-worker"
